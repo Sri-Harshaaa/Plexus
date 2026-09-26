@@ -118,6 +118,18 @@ class NearbyManager(
          */
         private const val RECOVERY_RESTART_SETTLE_MS =
             350L
+
+
+        private const val START_WATCHDOG_MS =
+            10_000L
+
+
+        private const val BASE_START_BACKOFF_MS =
+            2_000L
+
+
+        private const val MAX_START_BACKOFF_MS =
+            30_000L
     }
 
 
@@ -187,16 +199,44 @@ class NearbyManager(
         false
 
 
-    private var advertisingStartInFlight =
-        false
+    private var advertisingGeneration =
+        0L
+
+
+    private var advertisingRetryCount =
+        0
+
+
+    private var scheduledAdvertisingWatchdog:
+            Runnable? =
+        null
+
+
+    private var scheduledAdvertisingRetry:
+            Runnable? =
+        null
 
 
     private var discoveryActive =
         false
 
 
-    private var discoveryStartInFlight =
-        false
+    private var discoveryGeneration =
+        0L
+
+
+    private var discoveryRetryCount =
+        0
+
+
+    private var scheduledDiscoveryWatchdog:
+            Runnable? =
+        null
+
+
+    private var scheduledDiscoveryRetry:
+            Runnable? =
+        null
 
 
     /*
@@ -931,23 +971,23 @@ class NearbyManager(
 
         if (
             advertisingActive ||
-            advertisingStartInFlight
+            scheduledAdvertisingWatchdog != null ||
+            scheduledAdvertisingRetry != null
         ) {
-
-
-            Log.d(
-                TAG,
-                "ADVERTISING ALREADY ACTIVE/STARTING"
-            )
 
 
             return
         }
 
 
-        advertisingStartInFlight =
-            true
-        val startEpoch = recoveryEpoch
+        advertisingGeneration += 1L
+        val generation = advertisingGeneration
+
+
+        Log.d(
+            TAG,
+            "ADVERTISING START REQUESTED generation=$generation"
+        )
 
 
         val options =
@@ -957,6 +997,50 @@ class NearbyManager(
                     strategy
                 )
                 .build()
+
+
+        val watchdogRunnable =
+            Runnable {
+
+
+                if (
+                    !maintainNearbySessions ||
+                    generation != advertisingGeneration
+                ) {
+
+                    return@Runnable
+                }
+
+
+                Log.e(
+                    TAG,
+                    "ADVERTISING START TIMEOUT generation=$generation"
+                )
+
+
+                scheduledAdvertisingWatchdog =
+                    null
+
+
+                connectionsClient
+                    .stopAdvertising()
+
+
+                scheduleAdvertisingRetry()
+            }
+
+
+        scheduledAdvertisingWatchdog =
+            watchdogRunnable
+
+
+        recoveryHandler
+            .postDelayed(
+
+                watchdogRunnable,
+
+                START_WATCHDOG_MS
+            )
 
 
         connectionsClient
@@ -973,20 +1057,40 @@ class NearbyManager(
             .addOnSuccessListener {
 
 
-                if (!maintainNearbySessions || startEpoch != recoveryEpoch) return@addOnSuccessListener
+                if (
+                    !maintainNearbySessions ||
+                    generation != advertisingGeneration
+                ) {
+
+                    return@addOnSuccessListener
+                }
 
 
-                advertisingStartInFlight =
-                    false
+                scheduledAdvertisingWatchdog
+                    ?.let { runnable ->
+
+                        recoveryHandler
+                            .removeCallbacks(
+                                runnable
+                            )
+                    }
+
+
+                scheduledAdvertisingWatchdog =
+                    null
 
 
                 advertisingActive =
                     true
 
 
+                advertisingRetryCount =
+                    0
+
+
                 Log.d(
                     TAG,
-                    "Advertising started"
+                    "Advertising started generation=$generation"
                 )
 
 
@@ -995,15 +1099,38 @@ class NearbyManager(
             .addOnFailureListener { exception ->
 
 
-                if (!maintainNearbySessions || startEpoch != recoveryEpoch) return@addOnFailureListener
+                if (
+                    !maintainNearbySessions ||
+                    generation != advertisingGeneration
+                ) {
+
+                    return@addOnFailureListener
+                }
 
 
-                advertisingStartInFlight =
-                    false
+                scheduledAdvertisingWatchdog
+                    ?.let { runnable ->
+
+                        recoveryHandler
+                            .removeCallbacks(
+                                runnable
+                            )
+                    }
+
+
+                scheduledAdvertisingWatchdog =
+                    null
 
 
                 advertisingActive =
                     false
+
+
+                Log.e(
+                    TAG,
+                    "ADVERTISING START FAILED generation=$generation",
+                    exception
+                )
 
 
                 listener.onError(
@@ -1014,8 +1141,70 @@ class NearbyManager(
                     exception =
                         exception
                 )
-                scheduleNearbyRecovery("advertising start failed", 15_000L)
+
+
+                scheduleAdvertisingRetry()
             }
+    }
+
+
+    private fun scheduleAdvertisingRetry() {
+
+
+        if (
+            !maintainNearbySessions
+        ) {
+
+            return
+        }
+
+
+        advertisingRetryCount += 1
+
+
+        val backoff =
+            (BASE_START_BACKOFF_MS * advertisingRetryCount)
+                .coerceAtMost(
+                    MAX_START_BACKOFF_MS
+                )
+
+
+        val retryGeneration =
+            advertisingGeneration
+
+
+        val retryRunnable =
+            Runnable {
+
+
+                if (
+                    !maintainNearbySessions ||
+                    retryGeneration != advertisingGeneration
+                ) {
+
+                    return@Runnable
+                }
+
+
+                scheduledAdvertisingRetry =
+                    null
+
+
+                ensureAdvertising()
+            }
+
+
+        scheduledAdvertisingRetry =
+            retryRunnable
+
+
+        recoveryHandler
+            .postDelayed(
+
+                retryRunnable,
+
+                backoff
+            )
     }
 
 
@@ -1033,23 +1222,23 @@ class NearbyManager(
 
         if (
             discoveryActive ||
-            discoveryStartInFlight
+            scheduledDiscoveryWatchdog != null ||
+            scheduledDiscoveryRetry != null
         ) {
-
-
-            Log.d(
-                TAG,
-                "DISCOVERY ALREADY ACTIVE/STARTING"
-            )
 
 
             return
         }
 
 
-        discoveryStartInFlight =
-            true
-        val startEpoch = recoveryEpoch
+        discoveryGeneration += 1L
+        val generation = discoveryGeneration
+
+
+        Log.d(
+            TAG,
+            "DISCOVERY START REQUESTED generation=$generation"
+        )
 
 
         val options =
@@ -1059,6 +1248,50 @@ class NearbyManager(
                     strategy
                 )
                 .build()
+
+
+        val watchdogRunnable =
+            Runnable {
+
+
+                if (
+                    !maintainNearbySessions ||
+                    generation != discoveryGeneration
+                ) {
+
+                    return@Runnable
+                }
+
+
+                Log.e(
+                    TAG,
+                    "DISCOVERY START TIMEOUT generation=$generation"
+                )
+
+
+                scheduledDiscoveryWatchdog =
+                    null
+
+
+                connectionsClient
+                    .stopDiscovery()
+
+
+                scheduleDiscoveryRetry()
+            }
+
+
+        scheduledDiscoveryWatchdog =
+            watchdogRunnable
+
+
+        recoveryHandler
+            .postDelayed(
+
+                watchdogRunnable,
+
+                START_WATCHDOG_MS
+            )
 
 
         connectionsClient
@@ -1073,20 +1306,40 @@ class NearbyManager(
             .addOnSuccessListener {
 
 
-                if (!maintainNearbySessions || startEpoch != recoveryEpoch) return@addOnSuccessListener
+                if (
+                    !maintainNearbySessions ||
+                    generation != discoveryGeneration
+                ) {
+
+                    return@addOnSuccessListener
+                }
 
 
-                discoveryStartInFlight =
-                    false
+                scheduledDiscoveryWatchdog
+                    ?.let { runnable ->
+
+                        recoveryHandler
+                            .removeCallbacks(
+                                runnable
+                            )
+                    }
+
+
+                scheduledDiscoveryWatchdog =
+                    null
 
 
                 discoveryActive =
                     true
 
 
+                discoveryRetryCount =
+                    0
+
+
                 Log.d(
                     TAG,
-                    "Discovery started"
+                    "Discovery started generation=$generation"
                 )
 
 
@@ -1095,15 +1348,38 @@ class NearbyManager(
             .addOnFailureListener { exception ->
 
 
-                if (!maintainNearbySessions || startEpoch != recoveryEpoch) return@addOnFailureListener
+                if (
+                    !maintainNearbySessions ||
+                    generation != discoveryGeneration
+                ) {
+
+                    return@addOnFailureListener
+                }
 
 
-                discoveryStartInFlight =
-                    false
+                scheduledDiscoveryWatchdog
+                    ?.let { runnable ->
+
+                        recoveryHandler
+                            .removeCallbacks(
+                                runnable
+                            )
+                    }
+
+
+                scheduledDiscoveryWatchdog =
+                    null
 
 
                 discoveryActive =
                     false
+
+
+                Log.e(
+                    TAG,
+                    "DISCOVERY START FAILED generation=$generation",
+                    exception
+                )
 
 
                 listener.onError(
@@ -1114,8 +1390,70 @@ class NearbyManager(
                     exception =
                         exception
                 )
-                scheduleNearbyRecovery("discovery start failed", 15_000L)
+
+
+                scheduleDiscoveryRetry()
             }
+    }
+
+
+    private fun scheduleDiscoveryRetry() {
+
+
+        if (
+            !maintainNearbySessions
+        ) {
+
+            return
+        }
+
+
+        discoveryRetryCount += 1
+
+
+        val backoff =
+            (BASE_START_BACKOFF_MS * discoveryRetryCount)
+                .coerceAtMost(
+                    MAX_START_BACKOFF_MS
+                )
+
+
+        val retryGeneration =
+            discoveryGeneration
+
+
+        val retryRunnable =
+            Runnable {
+
+
+                if (
+                    !maintainNearbySessions ||
+                    retryGeneration != discoveryGeneration
+                ) {
+
+                    return@Runnable
+                }
+
+
+                scheduledDiscoveryRetry =
+                    null
+
+
+                ensureDiscovery()
+            }
+
+
+        scheduledDiscoveryRetry =
+            retryRunnable
+
+
+        recoveryHandler
+            .postDelayed(
+
+                retryRunnable,
+
+                backoff
+            )
     }
 
 
@@ -2241,8 +2579,35 @@ class NearbyManager(
             false
 
 
-        advertisingStartInFlight =
-            false
+        advertisingGeneration += 1L
+
+
+        scheduledAdvertisingWatchdog
+            ?.let { runnable ->
+
+                recoveryHandler
+                    .removeCallbacks(
+                        runnable
+                    )
+            }
+
+
+        scheduledAdvertisingWatchdog =
+            null
+
+
+        scheduledAdvertisingRetry
+            ?.let { runnable ->
+
+                recoveryHandler
+                    .removeCallbacks(
+                        runnable
+                    )
+            }
+
+
+        scheduledAdvertisingRetry =
+            null
 
 
         connectionsClient
@@ -2258,8 +2623,35 @@ class NearbyManager(
             false
 
 
-        discoveryStartInFlight =
-            false
+        discoveryGeneration += 1L
+
+
+        scheduledDiscoveryWatchdog
+            ?.let { runnable ->
+
+                recoveryHandler
+                    .removeCallbacks(
+                        runnable
+                    )
+            }
+
+
+        scheduledDiscoveryWatchdog =
+            null
+
+
+        scheduledDiscoveryRetry
+            ?.let { runnable ->
+
+                recoveryHandler
+                    .removeCallbacks(
+                        runnable
+                    )
+            }
+
+
+        scheduledDiscoveryRetry =
+            null
 
 
         connectionsClient
