@@ -1,0 +1,2354 @@
+package com.plexus.app
+
+import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import java.security.MessageDigest
+import android.util.Base64
+import org.json.JSONObject
+import android.util.Log
+import com.google.android.gms.nearby.Nearby
+import com.google.android.gms.nearby.connection.AdvertisingOptions
+import com.google.android.gms.nearby.connection.ConnectionInfo
+import com.google.android.gms.nearby.connection.ConnectionLifecycleCallback
+import com.google.android.gms.nearby.connection.ConnectionResolution
+import com.google.android.gms.nearby.connection.ConnectionsClient
+import com.google.android.gms.nearby.connection.DiscoveredEndpointInfo
+import com.google.android.gms.nearby.connection.DiscoveryOptions
+import com.google.android.gms.nearby.connection.EndpointDiscoveryCallback
+import com.google.android.gms.nearby.connection.Payload
+import com.google.android.gms.nearby.connection.PayloadCallback
+import com.google.android.gms.nearby.connection.PayloadTransferUpdate
+import com.google.android.gms.nearby.connection.Strategy
+
+
+class NearbyManager(
+
+    context: Context,
+
+    private val localEndpointName: String,
+
+    private val listener: Listener
+
+) {
+
+
+    interface Listener {
+
+
+        fun onAdvertisingStarted()
+
+
+        fun onDiscoveryStarted()
+
+
+        fun onEndpointFound(
+            endpointId: String,
+            endpointName: String
+        )
+
+
+        fun onEndpointLost(
+            endpointId: String
+        )
+
+
+        fun onConnectionInitiated(
+            endpointId: String,
+            endpointName: String,
+            authenticationDigits: String
+        )
+
+
+        fun onConnected(
+            endpointId: String
+        )
+
+
+        fun onDisconnected(
+            endpointId: String
+        )
+
+
+        fun onBytesReceived(
+            endpointId: String,
+            bytes: ByteArray
+        )
+
+
+        fun onError(
+            message: String,
+            exception: Exception? = null
+        )
+    }
+
+
+
+    companion object {
+
+
+        private const val TAG =
+            "PlexusNearby"
+
+
+        /*
+         * A challenge should only live for a short time.
+         *
+         * This uses OUR local clock only, so it does not depend
+         * on both phones having perfectly synchronized clocks.
+         */
+        private const val AUTH_CHALLENGE_LIFETIME_MS =
+            120_000L
+
+
+        /*
+         * Nearby may keep discovery state cached across an established
+         * connection. When a transport such as WIFI_LAN dies, we restart
+         * advertising/discovery after the disconnect so Play Services can
+         * rediscover the peer over the currently available medium.
+         */
+        private const val RECOVERY_DEBOUNCE_MS =
+            750L
+
+
+        /*
+         * Small gap between stop*() and start*() so the previous Nearby
+         * session has time to release its medium-specific resources.
+         */
+        private const val RECOVERY_RESTART_SETTLE_MS =
+            350L
+    }
+
+
+
+    private data class PendingAuthentication(
+
+        val challengerNodeId: String,
+
+        val responderNodeId: String,
+
+        val challenge: String,
+
+        val createdAt: Long
+    )
+
+
+
+    private val appContext =
+        context.applicationContext
+
+
+    private val connectionsClient:
+            ConnectionsClient =
+        Nearby.getConnectionsClient(
+            appContext
+        )
+
+
+    private val serviceId =
+        appContext.packageName
+
+
+    private val strategy =
+        Strategy.P2P_CLUSTER
+
+
+
+    /*
+     * =========================================================
+     * CONNECTION STATE
+     * =========================================================
+     */
+
+    private val connectedEndpoints =
+        mutableSetOf<String>()
+
+
+    private val pendingEndpoints =
+        mutableSetOf<String>()
+
+
+    private val discoveredEndpointNames =
+        mutableMapOf<String, String>()
+
+
+    /*
+     * Tracks whether Plexus wants Nearby discovery/advertising to remain
+     * alive. stopEverything() disables this before tearing the manager down,
+     * which prevents disconnect callbacks from accidentally resurrecting
+     * Nearby while the Activity is being disposed.
+     */
+    private var maintainNearbySessions =
+        false
+
+
+    private var advertisingActive =
+        false
+
+
+    private var advertisingStartInFlight =
+        false
+
+
+    private var discoveryActive =
+        false
+
+
+    private var discoveryStartInFlight =
+        false
+
+
+    /*
+     * A single peer can disappear through several callbacks in quick
+     * succession. Debounce recovery so those events collapse into one
+     * advertising/discovery reset instead of producing a restart storm.
+     */
+    private val recoveryHandler =
+        Handler(
+            Looper.getMainLooper()
+        )
+
+
+    private var recoveryEpoch =
+        0L
+
+
+    private var scheduledRecoveryRunnable:
+            Runnable? =
+        null
+
+
+    private var scheduledRestartRunnable:
+            Runnable? =
+        null
+
+
+    /*
+     * =========================================================
+     * PRIORITIZED OUTBOUND BYTES QUEUE
+     * =========================================================
+     *
+     * Nearby Connections accepts many sendPayload() calls immediately and
+     * may queue them internally. That is fine for bulk relay traffic, but it
+     * means a later control packet (connection request / response / auth)
+     * can otherwise sit behind a large anti-packet backlog.
+     *
+     * Plexus therefore keeps ONE in-flight BYTES payload per endpoint and
+     * orders the remaining work itself:
+     *
+     *     CONTROL    -> auth + connection control
+     *     MESSAGE    -> user chat payloads
+     *     BACKGROUND -> anti-packets + relay propagation
+     *
+     * A new CONTROL packet cannot interrupt the single payload already on
+     * the wire, but it jumps ahead of every queued MESSAGE/BACKGROUND item.
+     */
+    enum class SendPriority(
+        internal val rank: Int
+    ) {
+        CONTROL(0),
+        MESSAGE(1),
+        BACKGROUND(2)
+    }
+
+
+    private val outboxes = mutableMapOf<String, EndpointOutbox>()
+    private val transferWatchdogs = mutableMapOf<String, Runnable>()
+    private val connectionWatchdogs = mutableMapOf<String, Runnable>()
+    private var nextConnectionSession = 0L
+    private val connectionSessions = mutableMapOf<String, Long>()
+    private val recentVaccineTransfers = LinkedHashMap<String, Long>()
+    private val receiveBudgets = mutableMapOf<String, ReceiveBudget>()
+    private data class ReceiveBudget(var tokens: Double = 128.0, var updatedAt: Long = SystemClock.elapsedRealtime())
+    private var lastRecoveryAt = -5_000L
+
+    /*
+     * =========================================================
+     * PLEXUS IDENTITY MAPPING
+     * =========================================================
+     *
+     * Nearby:
+     *
+     *     RGVJ
+     *
+     * Plexus:
+     *
+     *     cff6b3fb...
+     *
+     * Identity packets establish the claimed mapping.
+     *
+     * IMPORTANT:
+     *
+     * Mapping alone does NOT mean authenticated.
+     */
+
+    private val peerRoutes = PeerRoutes()
+    private val endpointToNodeId = peerRoutes.claims
+    private val nodeIdToEndpoint = peerRoutes.verified
+
+
+
+    /*
+     * =========================================================
+     * AUTHENTICATION STATE
+     * =========================================================
+     */
+
+    private val pendingAuthentications =
+        mutableMapOf<String, PendingAuthentication>()
+
+
+    /*
+     * Endpoint IDs that successfully proved ownership of their
+     * Plexus signing private key during THIS connection.
+     */
+    private val verifiedEndpoints =
+        mutableSetOf<String>()
+
+
+
+    /*
+     * =========================================================
+     * PAYLOAD CALLBACK
+     * =========================================================
+     */
+
+    private fun payloadCallback(session: Long) =
+        object :
+            PayloadCallback() {
+
+
+            override fun onPayloadReceived(
+                endpointId: String,
+                payload: Payload
+            ) {
+                if (Looper.myLooper() != Looper.getMainLooper()) {
+                    recoveryHandler.post { onPayloadReceived(endpointId, payload) }
+                    return
+                }
+
+                if (connectionSessions[endpointId] != session || endpointId !in connectedEndpoints) return
+                when (
+                    payload.type
+                ) {
+
+
+                    Payload.Type.BYTES -> {
+
+
+                        val bytes =
+                            payload.asBytes()
+
+
+                        if (
+                            bytes == null || bytes.size > EndpointOutbox.MAX_BYTES
+                        ) {
+
+
+                            Log.d(
+                                TAG,
+                                "EMPTY BYTES PAYLOAD from $endpointId"
+                            )
+
+
+                            return
+                        }
+
+
+                        Log.d(
+                            TAG,
+                            "BYTES RECEIVED ✅ from " +
+                                    "$endpointId | " +
+                                    "${bytes.size} bytes"
+                        )
+
+
+                        val budget = receiveBudgets.getOrPut(endpointId) { ReceiveBudget() }
+                        val now = SystemClock.elapsedRealtime()
+                        budget.tokens = minOf(128.0, budget.tokens + (now - budget.updatedAt) / 50.0)
+                        budget.updatedAt = now
+                        if (budget.tokens < 1.0) return
+                        budget.tokens -= 1.0
+                        listener.onBytesReceived(
+
+                            endpointId =
+                                endpointId,
+
+                            bytes =
+                                bytes
+                        )
+                    }
+
+
+                    else -> {
+
+
+                        Log.d(
+                            TAG,
+                            "UNSUPPORTED PAYLOAD TYPE from " +
+                                    "$endpointId -> ${payload.type}"
+                        )
+                    }
+                }
+            }
+
+
+
+            override fun onPayloadTransferUpdate(
+                endpointId: String,
+                update: PayloadTransferUpdate
+            ) {
+                if (Looper.myLooper() != Looper.getMainLooper()) {
+                    recoveryHandler.post { onPayloadTransferUpdate(endpointId, update) }
+                    return
+                }
+
+
+
+                if (connectionSessions[endpointId] != session) return
+                val box = outboxes[endpointId] ?: return
+                val transfer = box.inFlight ?: return
+                if (transfer.payloadId != update.payloadId) return
+
+                when (
+                    update.status
+                ) {
+
+
+                    PayloadTransferUpdate.Status.SUCCESS -> {
+
+
+                        Log.d(
+                            TAG,
+                            "PAYLOAD TRANSFER SUCCESS ✅ -> " +
+                                    "$endpointId | " +
+                                    "payload=${update.payloadId}"
+                        )
+
+
+                        finishOutgoingPayload(endpointId, transfer)
+                    }
+
+
+                    PayloadTransferUpdate.Status.FAILURE,
+                    PayloadTransferUpdate.Status.CANCELED -> {
+                        failOutgoingPayload(endpointId, transfer, "terminal status=${update.status}")
+                    }
+
+                    PayloadTransferUpdate.Status.IN_PROGRESS -> {
+
+                        /*
+                         * BYTES payloads are small and do not need progress
+                         * UI right now. Keep the state until a terminal
+                         * SUCCESS / FAILURE / CANCELED update arrives.
+                         */
+                    }
+                }
+            }
+        }
+
+
+
+    /*
+     * =========================================================
+     * CONNECTION LIFECYCLE
+     * =========================================================
+     */
+
+    private fun connectionLifecycleCallback() =
+        object : ConnectionLifecycleCallback() {
+            private val ownedSessions = mutableMapOf<String, Long>()
+
+
+            override fun onConnectionInitiated(
+                endpointId: String,
+                connectionInfo: ConnectionInfo
+            ) {
+                if (Looper.myLooper() != Looper.getMainLooper()) {
+                    recoveryHandler.post { onConnectionInitiated(endpointId, connectionInfo) }
+                    return
+                }
+
+                if (!maintainNearbySessions) return
+                // Nearby lifecycle events carry only an endpoint ID. Never reuse that ID in
+                // the same callback owner: an old disconnect would otherwise be ambiguous.
+                if (ownedSessions.containsKey(endpointId)) {
+                    if (ownedSessions[endpointId] != connectionSessions[endpointId]) {
+                        runCatching { connectionsClient.rejectConnection(endpointId) }
+                        scheduleNearbyRecovery("endpoint ID reused by retired callback -> $endpointId")
+                    }
+                    return
+                }
+                if (connectionSessions.size >= 16 && !connectionSessions.containsKey(endpointId)) {
+                    connectionsClient.rejectConnection(endpointId)
+                    return
+                }
+                if (endpointId in connectedEndpoints) {
+                    connectedEndpoints.remove(endpointId)
+                    clearAuthentication(endpointId)
+                    removeIdentityMapping(endpointId)
+                    listener.onDisconnected(endpointId)
+                }
+                receiveBudgets[endpointId] = ReceiveBudget()
+                val session = ++nextConnectionSession
+                ownedSessions[endpointId] = session
+                connectionSessions[endpointId] = session
+                clearOutgoingForEndpoint(endpointId)
+                armConnectionWatchdog(endpointId)
+
+
+
+                pendingEndpoints.add(
+                    endpointId
+                )
+
+
+                val endpointName =
+                    discoveredEndpointNames[
+                        endpointId
+                    ]
+                        ?: connectionInfo.endpointName
+
+
+                Log.d(
+                    TAG,
+                    "CONNECTION INITIATED -> " +
+                            "$endpointName | " +
+                            "endpoint=$endpointId | " +
+                            "auth=${connectionInfo.authenticationDigits}"
+                )
+
+
+                listener.onConnectionInitiated(
+
+                    endpointId =
+                        endpointId,
+
+                    endpointName =
+                        endpointName,
+
+                    authenticationDigits =
+                        connectionInfo.authenticationDigits
+                )
+
+
+                /*
+                 * Development behaviour:
+                 *
+                 * Nearby transport connections are auto-accepted.
+                 *
+                 * Plexus cryptographic authentication happens
+                 * AFTER transport connection establishment.
+                 */
+                connectionsClient
+                    .acceptConnection(
+
+                        endpointId,
+
+                        payloadCallback(session)
+                    )
+                    .addOnSuccessListener {
+
+
+                        Log.d(
+                            TAG,
+                            "ACCEPTED -> $endpointId"
+                        )
+                    }
+                    .addOnFailureListener { exception ->
+                        if (!maintainNearbySessions || connectionSessions[endpointId] != session) return@addOnFailureListener
+
+
+
+                        pendingEndpoints.remove(
+                            endpointId
+                        )
+
+
+                        listener.onError(
+
+                            message =
+                                "ACCEPT CONNECTION FAILED -> $endpointId",
+
+                            exception =
+                                exception
+                        )
+
+
+                        scheduleNearbyRecovery(
+                            reason =
+                                "accept connection failure -> $endpointId"
+                        )
+                    }
+            }
+
+
+
+            override fun onConnectionResult(
+                endpointId: String,
+                result: ConnectionResolution
+            ) {
+                if (Looper.myLooper() != Looper.getMainLooper()) {
+                    recoveryHandler.post { onConnectionResult(endpointId, result) }
+                    return
+                }
+
+                if (!maintainNearbySessions || ownedSessions[endpointId] != connectionSessions[endpointId] ||
+                    !connectionSessions.containsKey(endpointId)) return
+
+
+
+                pendingEndpoints.remove(
+                    endpointId
+                )
+
+
+                when (
+                    result.status.statusCode
+                ) {
+
+
+                    com.google.android.gms.common.api
+                        .CommonStatusCodes.SUCCESS -> {
+
+
+                        if (endpointId in connectedEndpoints) return
+                        clearOutgoingForEndpoint(endpointId)
+                        outboxes[endpointId] = EndpointOutbox(connectionSessions.getValue(endpointId))
+                        connectedEndpoints.add(endpointId)
+
+
+                        /*
+                         * A fresh transport connection requires
+                         * fresh authentication.
+                         */
+                        clearAuthentication(
+                            endpointId
+                        )
+
+
+                        Log.d(
+                            TAG,
+                            "CONNECTED ✅ -> $endpointId"
+                        )
+
+
+                        listener.onConnected(
+                            endpointId
+                        )
+                    }
+
+
+                    else -> {
+                        clearOutgoingForEndpoint(endpointId)
+                        connectionWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
+                        connectionSessions.remove(endpointId)
+
+
+
+                        connectedEndpoints.remove(
+                            endpointId
+                        )
+
+
+                        removeIdentityMapping(
+                            endpointId
+                        )
+
+
+                        clearAuthentication(
+                            endpointId
+                        )
+
+
+                        listener.onError(
+
+                            message =
+                                "CONNECTION REJECTED/FAILED -> " +
+                                        "$endpointId | " +
+                                        "status=${result.status.statusCode}"
+                        )
+
+
+                        scheduleNearbyRecovery(
+                            reason =
+                                "connection result failure -> $endpointId"
+                        )
+                    }
+                }
+            }
+
+
+
+            override fun onDisconnected(
+                endpointId: String
+            ) {
+                if (Looper.myLooper() != Looper.getMainLooper()) {
+                    recoveryHandler.post { onDisconnected(endpointId) }
+                    return
+                }
+
+                if (!maintainNearbySessions || ownedSessions[endpointId] != connectionSessions[endpointId] ||
+                    !connectionSessions.containsKey(endpointId)) return
+                connectionSessions.remove(endpointId)
+                connectionWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
+                receiveBudgets.remove(endpointId)
+
+
+
+                connectedEndpoints.remove(
+                    endpointId
+                )
+
+
+                pendingEndpoints.remove(
+                    endpointId
+                )
+
+
+                clearAuthentication(
+                    endpointId
+                )
+
+
+                clearOutgoingForEndpoint(
+                    endpointId
+                )
+
+
+                removeIdentityMapping(
+                    endpointId
+                )
+
+
+                Log.d(
+                    TAG,
+                    "DISCONNECTED -> $endpointId"
+                )
+
+
+                listener.onDisconnected(
+                    endpointId
+                )
+
+
+                scheduleNearbyRecovery(
+                    reason =
+                        "endpoint disconnected -> $endpointId"
+                )
+            }
+        }
+
+
+
+    /*
+     * =========================================================
+     * DISCOVERY
+     * =========================================================
+     */
+
+    private val endpointDiscoveryCallback =
+        object :
+            EndpointDiscoveryCallback() {
+
+
+            override fun onEndpointFound(
+                endpointId: String,
+                info: DiscoveredEndpointInfo
+            ) {
+                if (Looper.myLooper() != Looper.getMainLooper()) {
+                    recoveryHandler.post { onEndpointFound(endpointId, info) }
+                    return
+                }
+
+                if (!maintainNearbySessions) return
+
+
+                discoveredEndpointNames[
+                    endpointId
+                ] =
+                    info.endpointName
+
+
+                Log.d(
+                    TAG,
+                    "FOUND -> " +
+                            "${info.endpointName} | " +
+                            endpointId
+                )
+
+
+                listener.onEndpointFound(
+
+                    endpointId =
+                        endpointId,
+
+                    endpointName =
+                        info.endpointName
+                )
+
+
+                /*
+                 * Ignore our own advertisement.
+                 */
+                if (
+                    info.endpointName ==
+                    localEndpointName
+                ) {
+
+
+                    Log.d(
+                        TAG,
+                        "IGNORING SELF -> ${info.endpointName}"
+                    )
+
+
+                    return
+                }
+
+
+                /*
+                 * Deterministic initiator selection.
+                 *
+                 * This prevents both phones simultaneously
+                 * requesting the same connection.
+                 */
+                if (
+                    localEndpointName <
+                    info.endpointName
+                ) {
+
+
+                    Log.d(
+                        TAG,
+                        "INITIATOR -> ${info.endpointName}"
+                    )
+
+
+                    connect(
+
+                        endpointId =
+                            endpointId,
+
+                        endpointName =
+                            info.endpointName
+                    )
+
+                } else {
+
+
+                    Log.d(
+                        TAG,
+                        "WAITING FOR PEER -> ${info.endpointName}"
+                    )
+                }
+            }
+
+
+
+            override fun onEndpointLost(
+                endpointId: String
+            ) {
+                if (Looper.myLooper() != Looper.getMainLooper()) {
+                    recoveryHandler.post { onEndpointLost(endpointId) }
+                    return
+                }
+
+
+
+                discoveredEndpointNames.remove(
+                    endpointId
+                )
+
+
+                Log.d(
+                    TAG,
+                    "LOST -> $endpointId"
+                )
+
+
+                listener.onEndpointLost(
+                    endpointId
+                )
+            }
+        }
+
+
+
+    /*
+     * =========================================================
+     * ADVERTISING
+     * =========================================================
+     */
+
+    fun startAdvertising() {
+
+
+        maintainNearbySessions =
+            true
+
+
+        ensureAdvertising()
+    }
+
+
+
+    /*
+     * =========================================================
+     * DISCOVERY START
+     * =========================================================
+     */
+
+    fun startDiscovery() {
+
+
+        maintainNearbySessions =
+            true
+
+
+        ensureDiscovery()
+    }
+
+
+
+    /*
+     * =========================================================
+     * ADVERTISING / DISCOVERY INTERNAL START
+     * =========================================================
+     */
+
+    private fun ensureAdvertising() {
+
+
+        if (
+            !maintainNearbySessions
+        ) {
+
+            return
+        }
+
+
+        if (
+            advertisingActive ||
+            advertisingStartInFlight
+        ) {
+
+
+            Log.d(
+                TAG,
+                "ADVERTISING ALREADY ACTIVE/STARTING"
+            )
+
+
+            return
+        }
+
+
+        advertisingStartInFlight =
+            true
+        val startEpoch = recoveryEpoch
+
+
+        val options =
+            AdvertisingOptions
+                .Builder()
+                .setStrategy(
+                    strategy
+                )
+                .build()
+
+
+        connectionsClient
+            .startAdvertising(
+
+                localEndpointName,
+
+                serviceId,
+
+                connectionLifecycleCallback(),
+
+                options
+            )
+            .addOnSuccessListener {
+
+
+                if (!maintainNearbySessions || startEpoch != recoveryEpoch) return@addOnSuccessListener
+
+
+                advertisingStartInFlight =
+                    false
+
+
+                advertisingActive =
+                    true
+
+
+                Log.d(
+                    TAG,
+                    "Advertising started"
+                )
+
+
+                listener.onAdvertisingStarted()
+            }
+            .addOnFailureListener { exception ->
+
+
+                if (!maintainNearbySessions || startEpoch != recoveryEpoch) return@addOnFailureListener
+
+
+                advertisingStartInFlight =
+                    false
+
+
+                advertisingActive =
+                    false
+
+
+                listener.onError(
+
+                    message =
+                        "Advertising failed",
+
+                    exception =
+                        exception
+                )
+                scheduleNearbyRecovery("advertising start failed", 15_000L)
+            }
+    }
+
+
+
+    private fun ensureDiscovery() {
+
+
+        if (
+            !maintainNearbySessions
+        ) {
+
+            return
+        }
+
+
+        if (
+            discoveryActive ||
+            discoveryStartInFlight
+        ) {
+
+
+            Log.d(
+                TAG,
+                "DISCOVERY ALREADY ACTIVE/STARTING"
+            )
+
+
+            return
+        }
+
+
+        discoveryStartInFlight =
+            true
+        val startEpoch = recoveryEpoch
+
+
+        val options =
+            DiscoveryOptions
+                .Builder()
+                .setStrategy(
+                    strategy
+                )
+                .build()
+
+
+        connectionsClient
+            .startDiscovery(
+
+                serviceId,
+
+                endpointDiscoveryCallback,
+
+                options
+            )
+            .addOnSuccessListener {
+
+
+                if (!maintainNearbySessions || startEpoch != recoveryEpoch) return@addOnSuccessListener
+
+
+                discoveryStartInFlight =
+                    false
+
+
+                discoveryActive =
+                    true
+
+
+                Log.d(
+                    TAG,
+                    "Discovery started"
+                )
+
+
+                listener.onDiscoveryStarted()
+            }
+            .addOnFailureListener { exception ->
+
+
+                if (!maintainNearbySessions || startEpoch != recoveryEpoch) return@addOnFailureListener
+
+
+                discoveryStartInFlight =
+                    false
+
+
+                discoveryActive =
+                    false
+
+
+                listener.onError(
+
+                    message =
+                        "Discovery failed",
+
+                    exception =
+                        exception
+                )
+                scheduleNearbyRecovery("discovery start failed", 15_000L)
+            }
+    }
+
+
+
+    /*
+     * =========================================================
+     * NEARBY SESSION RECOVERY
+     * =========================================================
+     *
+     * A transport handoff can look like:
+     *
+     *     WIFI_LAN dies
+     *         ->
+     *     onDisconnected()
+     *         ->
+     *     old discovery session still remembers the peer
+     *         ->
+     *     no fresh onEndpointFound()
+     *
+     * Resetting advertising/discovery gives Nearby a fresh medium scan.
+     * Existing connected endpoints are NOT stopped here.
+     */
+
+    fun restartNearby(
+        reason: String =
+            "manual"
+    ) {
+
+
+        if (
+            !maintainNearbySessions
+        ) {
+
+
+            Log.d(
+                TAG,
+                "NEARBY RECOVERY SKIPPED - MANAGER STOPPED | $reason"
+            )
+
+
+            return
+        }
+
+
+        scheduleNearbyRecovery(
+            reason =
+                reason
+        )
+    }
+
+
+
+    private fun scheduleNearbyRecovery(
+        reason: String,
+        delayMs: Long = RECOVERY_DEBOUNCE_MS
+    ) {
+
+
+        if (
+            !maintainNearbySessions
+        ) {
+
+            return
+        }
+
+
+        if (scheduledRecoveryRunnable != null || scheduledRestartRunnable != null) return
+        recoveryEpoch +=
+            1L
+
+
+        val epoch =
+            recoveryEpoch
+
+
+        scheduledRecoveryRunnable
+            ?.let { runnable ->
+
+                recoveryHandler
+                    .removeCallbacks(
+                        runnable
+                    )
+            }
+
+
+        scheduledRestartRunnable
+            ?.let { runnable ->
+
+                recoveryHandler
+                    .removeCallbacks(
+                        runnable
+                    )
+            }
+
+
+        val recoveryRunnable =
+            Runnable {
+
+
+                if (
+                    !maintainNearbySessions ||
+                    epoch != recoveryEpoch
+                ) {
+
+                    return@Runnable
+                }
+
+
+                Log.d(
+                    TAG,
+                    "NEARBY RECOVERY RESET 🔄 -> $reason"
+                )
+                scheduledRecoveryRunnable = null
+                lastRecoveryAt = SystemClock.elapsedRealtime()
+
+
+                /*
+                 * Discovered endpoint IDs belong to the previous discovery
+                 * view of the world. Connected endpoints and authenticated
+                 * mappings for still-live connections are deliberately
+                 * preserved.
+                 *
+                 * onDisconnected()/failure callbacks already remove the
+                 * endpoint that triggered recovery from pendingEndpoints.
+                 *
+                 * Do NOT clear the whole pending set here: another peer may
+                 * legitimately be in the middle of a connection handshake.
+                 */
+                discoveredEndpointNames.clear()
+
+
+                stopAdvertising()
+
+                stopDiscovery()
+
+
+                val restartRunnable =
+                    Runnable {
+
+
+                        if (
+                            !maintainNearbySessions ||
+                            epoch != recoveryEpoch
+                        ) {
+
+                            return@Runnable
+                        }
+
+
+                        Log.d(
+                            TAG,
+                            "NEARBY RECOVERY RESTART 🔄 -> $reason"
+                        )
+                        scheduledRestartRunnable = null
+
+
+                        ensureAdvertising()
+
+                        ensureDiscovery()
+                    }
+
+
+                scheduledRestartRunnable =
+                    restartRunnable
+
+
+                recoveryHandler
+                    .postDelayed(
+
+                        restartRunnable,
+
+                        RECOVERY_RESTART_SETTLE_MS
+                    )
+            }
+
+
+        scheduledRecoveryRunnable =
+            recoveryRunnable
+
+
+        Log.d(
+            TAG,
+            "NEARBY RECOVERY SCHEDULED 🔄 -> $reason"
+        )
+
+
+        recoveryHandler
+            .postDelayed(
+
+                recoveryRunnable,
+
+                maxOf(delayMs, 5_000L - (SystemClock.elapsedRealtime() - lastRecoveryAt))
+            )
+    }
+
+
+
+    /*
+     * =========================================================
+     * CONNECT
+     * =========================================================
+     */
+
+    private fun connect(
+        endpointId: String,
+        endpointName: String
+    ) {
+        if (!maintainNearbySessions || connectedEndpoints.size + pendingEndpoints.size >= 16) return
+
+
+        if (
+            connectedEndpoints.contains(
+                endpointId
+            )
+        ) {
+
+            return
+        }
+
+
+        if (
+            pendingEndpoints.contains(
+                endpointId
+            )
+        ) {
+
+            return
+        }
+
+
+        pendingEndpoints.add(
+            endpointId
+        )
+
+
+        armConnectionWatchdog(endpointId)
+        val requestWatchdog = connectionWatchdogs[endpointId]
+
+        Log.d(
+            TAG,
+            "REQUEST CONNECTION -> " +
+                    "$endpointName | $endpointId"
+        )
+
+
+        connectionsClient
+            .requestConnection(
+
+                localEndpointName,
+
+                endpointId,
+
+                connectionLifecycleCallback()
+            )
+            .addOnSuccessListener {
+
+
+                Log.d(
+                    TAG,
+                    "REQUEST SENT -> $endpointId"
+                )
+            }
+            .addOnFailureListener { exception ->
+                if (!maintainNearbySessions || connectionWatchdogs[endpointId] !== requestWatchdog) return@addOnFailureListener
+                connectionWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
+
+
+
+                pendingEndpoints.remove(
+                    endpointId
+                )
+
+
+                listener.onError(
+
+                    message =
+                        "REQUEST CONNECTION FAILED -> $endpointId",
+
+                    exception =
+                        exception
+                )
+
+
+                scheduleNearbyRecovery(
+                    reason =
+                        "request connection failure -> $endpointId"
+                )
+            }
+    }
+
+
+
+    /*
+     * =========================================================
+     * RAW ENDPOINT SEND
+     * =========================================================
+     *
+     * Used for protocol messages such as:
+     *
+     * identity
+     * auth challenge
+     * auth proof
+     *
+     * because authentication may not yet be complete.
+     */
+
+    fun sendBytes(
+        endpointId: String,
+        bytes: ByteArray,
+        priority: SendPriority =
+            SendPriority.CONTROL
+    ) {
+
+
+        enqueueBytes(
+
+            endpointId =
+                endpointId,
+
+            bytes =
+                bytes,
+
+            priority =
+                priority
+        )
+    }
+
+
+
+    /*
+     * =========================================================
+     * REGISTER ANNOUNCED IDENTITY
+     * =========================================================
+     *
+     * This means:
+     *
+     * endpoint RGVJ CLAIMS to be node abc...
+     *
+     * It does NOT mean we trust that claim yet.
+     */
+
+    fun registerPeerIdentity(endpointId: String, nodeId: String) {
+        if (endpointId !in connectedEndpoints || nodeId.isBlank()) return
+        if (endpointToNodeId[endpointId] != nodeId) clearAuthentication(endpointId)
+        peerRoutes.claim(endpointId, nodeId)
+        Log.d(TAG, "IDENTITY CLAIM MAPPED -> $endpointId <-> ${nodeId.take(8)}")
+    }
+
+
+    /*
+     * =========================================================
+     * BEGIN AUTHENTICATION
+     * =========================================================
+     *
+     * Local node A challenges remote node B.
+     */
+
+    fun beginAuthentication(
+
+        endpointId: String,
+
+        challengerNodeId: String,
+
+        responderNodeId: String
+
+    ): Boolean {
+
+
+        if (
+            !connectedEndpoints.contains(
+                endpointId
+            )
+        ) {
+
+
+            Log.d(
+                TAG,
+                "AUTH SKIPPED - ENDPOINT NOT CONNECTED -> $endpointId"
+            )
+
+
+            return false
+        }
+
+
+        val mappedNodeId =
+            endpointToNodeId[
+                endpointId
+            ]
+
+
+        if (
+            mappedNodeId !=
+            responderNodeId
+        ) {
+
+
+            Log.e(
+                TAG,
+                "AUTH SKIPPED - IDENTITY MAPPING MISMATCH -> " +
+                        "$endpointId | expected=${responderNodeId.take(8)}"
+            )
+
+
+            return false
+        }
+
+
+        /*
+         * New challenge means any previous proof for this
+         * endpoint is no longer sufficient.
+         */
+        verifiedEndpoints.remove(
+            endpointId
+        )
+
+
+        val challengePacket =
+            NearbyAuthPacket
+                .createChallenge(
+
+                    challengerNodeId =
+                        challengerNodeId,
+
+                    responderNodeId =
+                        responderNodeId
+                )
+
+
+        pendingAuthentications[
+            endpointId
+        ] =
+            PendingAuthentication(
+
+                challengerNodeId =
+                    challengePacket.challengerNodeId,
+
+                responderNodeId =
+                    challengePacket.responderNodeId,
+
+                challenge =
+                    challengePacket.challenge,
+
+                createdAt =
+                    System.currentTimeMillis()
+            )
+
+
+        sendBytes(
+
+            endpointId =
+                endpointId,
+
+            bytes =
+                challengePacket.toBytes()
+        )
+
+
+        Log.d(
+            TAG,
+            "AUTH CHALLENGE SENT 🔐 -> " +
+                    "$endpointId | " +
+                    responderNodeId.take(8)
+        )
+
+
+        return true
+    }
+
+
+
+    /*
+     * =========================================================
+     * VERIFY AUTH PROOF
+     * =========================================================
+     *
+     * Called when the peer returns:
+     *
+     *      challenge + signature
+     *
+     * We verify the signature using the public signing key
+     * already stored for that contact.
+     */
+
+    fun verifyAuthenticationProof(
+
+        endpointId: String,
+
+        proofPacket: NearbyAuthPacket,
+
+        publicSigningKey: String
+
+    ): Boolean {
+
+
+        if (
+            proofPacket.kind !=
+            NearbyAuthPacket.Kind.PROOF
+        ) {
+
+
+            return false
+        }
+
+
+        val pending =
+            pendingAuthentications[
+                endpointId
+            ]
+                ?: run {
+
+
+                    Log.e(
+                        TAG,
+                        "AUTH PROOF REJECTED - " +
+                                "NO PENDING CHALLENGE -> $endpointId"
+                    )
+
+
+                    return false
+                }
+
+
+
+        /*
+         * Challenge expiry is based only on OUR clock.
+         */
+        val age =
+            System.currentTimeMillis() -
+                    pending.createdAt
+
+
+        if (
+            age < 0L ||
+            age >
+            AUTH_CHALLENGE_LIFETIME_MS
+        ) {
+
+
+            pendingAuthentications.remove(
+                endpointId
+            )
+
+
+            Log.e(
+                TAG,
+                "AUTH PROOF REJECTED - " +
+                        "CHALLENGE EXPIRED -> $endpointId"
+            )
+
+
+            return false
+        }
+
+
+
+        /*
+         * The proof must correspond EXACTLY to the challenge
+         * we issued.
+         */
+        if (
+            proofPacket.challengerNodeId !=
+            pending.challengerNodeId ||
+            proofPacket.responderNodeId !=
+            pending.responderNodeId ||
+            proofPacket.challenge !=
+            pending.challenge
+        ) {
+
+
+            Log.e(
+                TAG,
+                "AUTH PROOF REJECTED - " +
+                        "CHALLENGE MISMATCH -> $endpointId"
+            )
+
+
+            return false
+        }
+
+
+
+        /*
+         * The endpoint currently claiming this connection must
+         * still be the responder named by the challenge.
+         */
+        val mappedNodeId =
+            endpointToNodeId[
+                endpointId
+            ]
+
+
+        if (
+            mappedNodeId !=
+            proofPacket.responderNodeId
+        ) {
+
+
+            Log.e(
+                TAG,
+                "AUTH PROOF REJECTED - " +
+                        "ENDPOINT IDENTITY CHANGED -> $endpointId"
+            )
+
+
+            return false
+        }
+
+
+
+        val signature =
+            proofPacket.signature
+                ?: return false
+
+
+
+        val authenticationMessage =
+            IdentityCrypto
+                .buildAuthenticationMessage(
+
+                    challengerNodeId =
+                        proofPacket
+                            .challengerNodeId,
+
+                    responderNodeId =
+                        proofPacket
+                            .responderNodeId,
+
+                    challenge =
+                        proofPacket
+                            .challenge
+                )
+
+
+
+        val valid =
+            IdentityCrypto
+                .verify(
+
+                    data =
+                        authenticationMessage,
+
+                    signatureBase64 =
+                        signature,
+
+                    publicKeyBase64 =
+                        publicSigningKey
+                )
+
+
+
+        /*
+         * Once a matching proof has been attempted,
+         * consume the challenge.
+         *
+         * The same proof cannot simply be replayed later.
+         */
+        pendingAuthentications.remove(
+            endpointId
+        )
+
+
+
+        if (
+            !valid
+        ) {
+
+
+            verifiedEndpoints.remove(
+                endpointId
+            )
+
+
+            Log.e(
+                TAG,
+                "AUTH FAILED ❌ -> " +
+                        "$endpointId | " +
+                        proofPacket.responderNodeId.take(8)
+            )
+
+
+            return false
+        }
+
+
+
+        connectionWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
+        // Only a valid live challenge proof may replace a route for this node.
+        val previousEndpoint = peerRoutes.promote(endpointId)
+        if (previousEndpoint != null) {
+            connectionWatchdogs.remove(previousEndpoint)?.let(recoveryHandler::removeCallbacks)
+            clearAuthentication(previousEndpoint)
+            clearOutgoingForEndpoint(previousEndpoint)
+            connectedEndpoints.remove(previousEndpoint)
+            connectionSessions.remove(previousEndpoint)
+            receiveBudgets.remove(previousEndpoint)
+            runCatching { connectionsClient.disconnectFromEndpoint(previousEndpoint) }
+            listener.onDisconnected(previousEndpoint)
+        }
+        verifiedEndpoints.add(
+            endpointId
+        )
+
+
+        Log.d(
+            TAG,
+            "AUTH VERIFIED ✅ 🔐 -> " +
+                    "$endpointId <-> " +
+                    proofPacket.responderNodeId.take(8)
+        )
+
+
+        return true
+    }
+
+
+
+    /*
+     * =========================================================
+     * AUTHENTICATION QUERIES
+     * =========================================================
+     */
+
+    fun isEndpointVerified(
+        endpointId: String
+    ): Boolean {
+
+
+        return verifiedEndpoints.contains(
+            endpointId
+        )
+    }
+
+
+
+    fun isNodeVerified(
+        nodeId: String
+    ): Boolean {
+
+
+        val endpointId =
+            nodeIdToEndpoint[
+                nodeId
+            ]
+                ?: return false
+
+
+        return verifiedEndpoints.contains(
+            endpointId
+        )
+    }
+
+
+
+    /*
+     * =========================================================
+     * DIRECT PLEXUS SEND
+     * =========================================================
+     *
+     * 1:1 application data is ONLY allowed after the peer has
+     * proven possession of its signing private key.
+     */
+
+    fun sendBytesToNode(
+        nodeId: String,
+        bytes: ByteArray,
+        priority: SendPriority =
+            SendPriority.MESSAGE
+    ): Boolean {
+
+
+        val endpointId =
+            nodeIdToEndpoint[
+                nodeId
+            ]
+
+
+        if (
+            endpointId == null
+        ) {
+
+
+            Log.d(
+                TAG,
+                "DIRECT SEND SKIPPED - " +
+                        "NODE NOT CONNECTED -> " +
+                        nodeId.take(8)
+            )
+
+
+            return false
+        }
+
+
+        if (
+            !verifiedEndpoints.contains(
+                endpointId
+            )
+        ) {
+
+
+            Log.d(
+                TAG,
+                "DIRECT SEND SKIPPED - " +
+                        "PEER NOT VERIFIED 🔒 -> " +
+                        nodeId.take(8)
+            )
+
+
+            return false
+        }
+
+
+        return enqueueBytes(
+
+            endpointId =
+                endpointId,
+
+            bytes =
+                bytes,
+
+            priority =
+                priority
+        )
+    }
+
+
+
+    /*
+     * =========================================================
+     * LOOKUPS
+     * =========================================================
+     */
+
+    fun getNodeIdForEndpoint(
+        endpointId: String
+    ): String? {
+
+
+        return endpointToNodeId[
+            endpointId
+        ]
+    }
+
+
+
+    fun getEndpointForNodeId(
+        nodeId: String
+    ): String? {
+
+
+        return nodeIdToEndpoint[
+            nodeId
+        ]
+    }
+
+
+
+    /*
+     * =========================================================
+     * BROADCAST
+     * =========================================================
+     *
+     * Retained for future mesh forwarding.
+     *
+     * Direct chat should NOT use this.
+     */
+
+    fun broadcastBytes(
+        bytes: ByteArray,
+        priority: SendPriority =
+            SendPriority.BACKGROUND,
+        excludeEndpointId: String? = null
+    ) {
+
+
+        val endpoints =
+            connectedEndpoints
+                .toList()
+
+
+        if (
+            endpoints.isEmpty()
+        ) {
+
+
+            Log.d(
+                TAG,
+                "BROADCAST SKIPPED - NO CONNECTED PEERS"
+            )
+
+
+            return
+        }
+
+
+        var queuedCount =
+            0
+
+
+        for (
+        endpointId in
+        endpoints
+        ) {
+            if (endpointId == excludeEndpointId || !verifiedEndpoints.contains(endpointId)) continue
+
+
+            val queued =
+                enqueueBytes(
+
+                    endpointId =
+                        endpointId,
+
+                    bytes =
+                        bytes,
+
+                    priority =
+                        priority
+                )
+
+
+            if (
+                queued
+            ) {
+
+                queuedCount +=
+                    1
+            }
+        }
+
+
+        Log.d(
+            TAG,
+            "BROADCAST ENQUEUED -> " +
+                    "$queuedCount/${endpoints.size} peer(s) | " +
+                    "priority=$priority"
+        )
+    }
+
+
+
+    /*
+     * =========================================================
+     * PRIORITIZED OUTGOING QUEUE INTERNALS
+     * =========================================================
+     */
+
+    private fun enqueueBytes(
+        endpointId: String,
+        bytes: ByteArray,
+        priority: SendPriority
+    ): Boolean {
+        check(Looper.myLooper() == Looper.getMainLooper())
+        if (bytes.isEmpty() || bytes.size > EndpointOutbox.MAX_BYTES) return false
+        if (!connectedEndpoints.contains(endpointId)) return false
+        val box = outboxes[endpointId] ?: return false
+        val now = SystemClock.elapsedRealtime()
+        val json = runCatching { JSONObject(bytes.toString(Charsets.UTF_8)) }.getOrNull()
+        val kind = json?.optString("type").orEmpty()
+        val digest = Base64.encodeToString(MessageDigest.getInstance("SHA-256").digest(bytes), Base64.NO_WRAP)
+        val key = when (kind) {
+            "delivery_anti_packet" -> "anti:$digest"
+            "mesh_message" -> "mesh:${json!!.optString("sourceNodeId")}:${json.optString("destinationNodeId")}:${json.optString("packetId")}:$digest"
+            else -> digest
+        }
+        val peerKey = endpointToNodeId[endpointId]?.let { "$it:$key" }
+        if (priority == SendPriority.BACKGROUND && key.startsWith("anti:") &&
+            peerKey != null && (recentVaccineTransfers[peerKey] ?: Long.MIN_VALUE) > now) return true
+        val oldSize = box.size
+        val accepted = box.offer(key, bytes, priority.rank, SystemClock.elapsedRealtime())
+        if (!accepted) {
+            Log.w(TAG, "OUTBOUND BACKPRESSURE -> $endpointId | priority=$priority | queued=${box.size} | durable retry retained")
+            return false
+        }
+        if (box.size > oldSize) Log.d(TAG, "OUTBOUND ENQUEUED -> $endpointId | priority=$priority | kind=$kind | queued=${box.size}")
+        drainOutboundQueue(endpointId)
+        return true
+    }
+
+    private fun drainOutboundQueue(endpointId: String) {
+        if (!connectedEndpoints.contains(endpointId)) return
+        val box = outboxes[endpointId] ?: return
+        val queued = box.poll() ?: return
+        val payload = Payload.fromBytes(queued.bytes)
+        val transfer = box.start(payload.id, queued)
+        // Arm before sendPayload: a hung request Task also needs a bounded lifetime.
+        val watchdog = Runnable {
+            if (outboxes[endpointId] === box && box.matches(transfer)) {
+                Log.w(TAG, "PAYLOAD WATCHDOG TIMEOUT -> $endpointId | payload=${payload.id} | session=${box.session}")
+                failOutgoingPayload(endpointId, transfer, "missing terminal callback")
+            }
+        }
+        transferWatchdogs[endpointId] = watchdog
+        recoveryHandler.postDelayed(watchdog, EndpointOutbox.TRANSFER_TIMEOUT_MS)
+        try {
+            connectionsClient.sendPayload(endpointId, payload)
+                .addOnSuccessListener {
+                    if (outboxes[endpointId] === box && box.matches(transfer)) {
+                        Log.d(TAG, "PAYLOAD DISPATCHED TO NEARBY -> $endpointId | payload=${payload.id} | priority=${queued.priority}")
+                    }
+                }
+                .addOnFailureListener { exception ->
+                    failOutgoingPayload(endpointId, transfer, "send request failed: ${exception.javaClass.simpleName}")
+                }
+                .addOnCanceledListener {
+                    failOutgoingPayload(endpointId, transfer, "send request canceled")
+                }
+        } catch (exception: Exception) {
+            failOutgoingPayload(endpointId, transfer, "send request threw: ${exception.javaClass.simpleName}")
+        }
+    }
+
+    private fun finishOutgoingPayload(endpointId: String, transfer: EndpointOutbox.Transfer) {
+        val box = outboxes[endpointId] ?: return
+        if (!box.finish(transfer, SystemClock.elapsedRealtime())) return
+        if (transfer.item.key.startsWith("anti:")) {
+            endpointToNodeId[endpointId]?.let { node ->
+                recentVaccineTransfers["$node:${transfer.item.key}"] = SystemClock.elapsedRealtime() + 300_000L
+                while (recentVaccineTransfers.size > 4096) recentVaccineTransfers.remove(recentVaccineTransfers.keys.first())
+            }
+        }
+        transferWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
+        // Post instead of recursively draining if Google completes requests inline.
+        recoveryHandler.post { drainOutboundQueue(endpointId) }
+    }
+
+    private fun failOutgoingPayload(endpointId: String, transfer: EndpointOutbox.Transfer, reason: String) {
+        val box = outboxes[endpointId] ?: return
+        if (!box.matches(transfer)) return
+        Log.w(TAG, "PAYLOAD TRANSFER ABORTED -> $endpointId | payload=${transfer.payloadId} | $reason")
+        // Invalidate before cancelPayload: Google may deliver cancellation immediately.
+        invalidateEndpoint(endpointId, "stale transfer")
+        runCatching { connectionsClient.cancelPayload(transfer.payloadId) }
+    }
+
+    private fun armConnectionWatchdog(endpointId: String) {
+        connectionWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
+        lateinit var watchdog: Runnable
+        watchdog = Runnable {
+            if (maintainNearbySessions && connectionWatchdogs[endpointId] === watchdog &&
+                endpointId !in verifiedEndpoints) {
+                Log.w(TAG, "CONNECTION AUTH TIMEOUT -> $endpointId")
+                invalidateEndpoint(endpointId, "connection/auth timeout")
+            }
+        }
+        connectionWatchdogs[endpointId] = watchdog
+        recoveryHandler.postDelayed(watchdog, 30_000L)
+    }
+
+    private fun invalidateEndpoint(endpointId: String, reason: String) {
+        clearOutgoingForEndpoint(endpointId)
+        connectionWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
+        connectionSessions.remove(endpointId)
+        receiveBudgets.remove(endpointId)
+        connectedEndpoints.remove(endpointId)
+        pendingEndpoints.remove(endpointId)
+        clearAuthentication(endpointId)
+        removeIdentityMapping(endpointId)
+        runCatching { connectionsClient.disconnectFromEndpoint(endpointId) }
+        listener.onDisconnected(endpointId)
+        scheduleNearbyRecovery("$reason -> $endpointId")
+    }
+
+    private fun clearOutgoingForEndpoint(endpointId: String) {
+        transferWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
+        outboxes.remove(endpointId)
+    }
+
+    fun getVerifiedNodeIds(): List<String> =
+        nodeIdToEndpoint.filterValues { it in verifiedEndpoints && it in connectedEndpoints }.keys.toList()
+
+    fun discardAcknowledged(packet: NearbyAntiPacket) {
+        val prefix = "mesh:${packet.sourceNodeId}:${packet.recipientNodeId}:${packet.messageId}:"
+        outboxes.values.forEach { it.discardQueued(prefix) }
+    }
+
+    /*
+     * =========================================================
+     * CLEAR AUTHENTICATION
+     * =========================================================
+     */
+
+    private fun clearAuthentication(
+        endpointId: String
+    ) {
+
+
+        pendingAuthentications.remove(
+            endpointId
+        )
+
+
+        verifiedEndpoints.remove(
+            endpointId
+        )
+    }
+
+
+
+    /*
+     * =========================================================
+     * REMOVE IDENTITY MAPPING
+     * =========================================================
+     */
+
+    private fun removeIdentityMapping(endpointId: String) {
+        val nodeId = endpointToNodeId[endpointId]
+        peerRoutes.remove(endpointId)
+        if (nodeId != null) Log.d(TAG, "PEER UNMAPPED -> $endpointId <-> ${nodeId.take(8)}")
+    }
+
+
+    /*
+     * =========================================================
+     * STOP
+     * =========================================================
+     */
+
+    fun stopAdvertising() {
+
+
+        advertisingActive =
+            false
+
+
+        advertisingStartInFlight =
+            false
+
+
+        connectionsClient
+            .stopAdvertising()
+    }
+
+
+
+    fun stopDiscovery() {
+
+
+        discoveryActive =
+            false
+
+
+        discoveryStartInFlight =
+            false
+
+
+        connectionsClient
+            .stopDiscovery()
+    }
+
+
+
+    fun disconnectAll() {
+
+
+        connectionsClient
+            .stopAllEndpoints()
+
+
+        connectedEndpoints.clear()
+
+        pendingEndpoints.clear()
+
+        discoveredEndpointNames.clear()
+
+        peerRoutes.clear()
+
+        pendingAuthentications.clear()
+
+        verifiedEndpoints.clear()
+
+        transferWatchdogs.values.forEach(recoveryHandler::removeCallbacks)
+        transferWatchdogs.clear()
+        connectionWatchdogs.values.forEach(recoveryHandler::removeCallbacks)
+        connectionWatchdogs.clear()
+        outboxes.clear()
+        connectionSessions.clear()
+        receiveBudgets.clear()
+        recentVaccineTransfers.clear()
+    }
+
+
+
+    fun stopEverything() {
+
+
+        /*
+         * Disable recovery BEFORE stopping endpoints. stopAllEndpoints()
+         * can lead to disconnect callbacks, and those callbacks must not
+         * restart Nearby while the owner is being disposed.
+         */
+        maintainNearbySessions =
+            false
+
+
+        recoveryEpoch +=
+            1L
+
+
+        scheduledRecoveryRunnable
+            ?.let { runnable ->
+
+                recoveryHandler
+                    .removeCallbacks(
+                        runnable
+                    )
+            }
+
+
+        scheduledRestartRunnable
+            ?.let { runnable ->
+
+                recoveryHandler
+                    .removeCallbacks(
+                        runnable
+                    )
+            }
+
+
+        scheduledRecoveryRunnable =
+            null
+
+
+        scheduledRestartRunnable =
+            null
+
+
+        recoveryHandler.removeCallbacksAndMessages(null)
+        stopAdvertising()
+
+        stopDiscovery()
+
+        disconnectAll()
+    }
+
+}

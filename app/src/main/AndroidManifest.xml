@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+
+    <!-- ===================================================== -->
+    <!-- CAMERA                                                -->
+    <!-- ===================================================== -->
+
+    <uses-permission
+        android:name="android.permission.CAMERA" />
+
+    <uses-feature
+        android:name="android.hardware.camera"
+        android:required="false" />
+
+
+    <!-- ===================================================== -->
+    <!-- WIFI                                                  -->
+    <!-- ===================================================== -->
+
+    <uses-permission
+        android:name="android.permission.ACCESS_WIFI_STATE" />
+
+    <uses-permission
+        android:name="android.permission.CHANGE_WIFI_STATE" />
+
+
+    <!-- ===================================================== -->
+    <!-- LEGACY BLUETOOTH                                      -->
+    <!-- ===================================================== -->
+
+    <uses-permission
+        android:name="android.permission.BLUETOOTH"
+        android:maxSdkVersion="30" />
+
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADMIN"
+        android:maxSdkVersion="30" />
+
+
+    <!-- ===================================================== -->
+    <!-- LOCATION                                              -->
+    <!-- ===================================================== -->
+
+    <!--
+        Compatibility permissions required by
+        play-services-nearby 19.4.0.
+
+        We intentionally keep these available on newer
+        Android versions because this older Nearby version
+        checks for them during discovery.
+    -->
+    <uses-permission
+        android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+    <uses-permission
+        android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+
+    <!-- ===================================================== -->
+    <!-- ANDROID 12+ BLUETOOTH                                 -->
+    <!-- ===================================================== -->
+
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_SCAN" />
+
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_ADVERTISE" />
+
+    <uses-permission
+        android:name="android.permission.BLUETOOTH_CONNECT" />
+
+
+    <!-- ===================================================== -->
+    <!-- NEARBY WIFI                                           -->
+    <!-- ===================================================== -->
+
+    <uses-permission
+        android:name="android.permission.NEARBY_WIFI_DEVICES" />
+
+
+    <!-- ===================================================== -->
+    <!-- ANDROID 17 / API 37 LOCAL NETWORK                     -->
+    <!-- ===================================================== -->
+
+    <uses-permission
+        android:name="android.permission.ACCESS_LOCAL_NETWORK" />
+
+
+    <!-- ===================================================== -->
+    <!-- INTERNET                                              -->
+    <!-- ===================================================== -->
+
+    <uses-permission
+        android:name="android.permission.INTERNET" />
+
+
+    <!-- ===================================================== -->
+    <!-- APPLICATION                                           -->
+    <!-- ===================================================== -->
+
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Plexus"
+        android:usesCleartextTraffic="false">
+
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Plexus"
+            android:windowSoftInputMode="adjustResize">
+
+
+            <!-- Normal launcher entry point. -->
+            <intent-filter>
+
+                <action
+                    android:name="android.intent.action.MAIN" />
+
+                <category
+                    android:name="android.intent.category.LAUNCHER" />
+
+            </intent-filter>
+
+
+            <!--
+                Verified Plexus HTTPS connect links.
+
+                Example:
+                https://plexus-server.onrender.com/connect#<encoded-identity>
+
+                Render serves:
+                https://plexus-server.onrender.com/.well-known/assetlinks.json
+
+                The URI fragment is intentionally NOT matched here.
+                Android routes /connect to MainActivity; PlexusDeepLink
+                validates and decodes the fragment inside the app.
+            -->
+            <intent-filter
+                android:autoVerify="true">
+
+                <action
+                    android:name="android.intent.action.VIEW" />
+
+                <category
+                    android:name="android.intent.category.DEFAULT" />
+
+                <category
+                    android:name="android.intent.category.BROWSABLE" />
+
+                <data
+                    android:scheme="https"
+                    android:host="plexus-server.onrender.com"
+                    android:path="/connect" />
+
+            </intent-filter>
+
+
+        </activity>
+
+
+    </application>
+
+</manifest>
