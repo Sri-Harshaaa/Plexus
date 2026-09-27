@@ -9,7 +9,7 @@ internal suspend fun retryNearbyPackets(
 ) {
     val peers = manager.getVerifiedNodeIds()
     if (peers.isEmpty()) return
-    val vaccines = antiPacketStore.getPropagationCandidates()
+    val vaccineCount = antiPacketStore.activeAntiPacketCount()
     for (peer in peers) {
         val packets = relayStore.getForwardCandidates(peer, localNodeId = localNodeId)
         val (messages, relays) = packets.partition {
@@ -18,17 +18,19 @@ internal suspend fun retryNearbyPackets(
         for (packet in messages) {
             if (!manager.sendBytesToNode(peer, packet.toBytes(), NearbyManager.SendPriority.MESSAGE)) break
         }
-        // Alternate vaccines and relay traffic; neither historical category owns the backlog.
-        for (index in 0 until maxOf(vaccines.size, relays.size)) {
-            if (!manager.isNodeVerified(peer)) break
-            val vaccine = vaccines.getOrNull(index)
-            if (vaccine != null &&
-                !manager.sendBytesToNode(peer, vaccine.toBytes(), NearbyManager.SendPriority.BACKGROUND)
-            ) break
-            val relay = relays.getOrNull(index)
-            if (relay != null &&
-                !manager.sendBytesToNode(peer, relay.toBytes(), NearbyManager.SendPriority.BACKGROUND)
-            ) break
+        // Four historical slots per five-second scan, rotating through the full
+        // history rather than filling the queue on every reconnect. Room retains
+        // everything skipped. Fresh messages above never wait for this window.
+        val vaccineOffset = manager.nextBackgroundOffset("$peer:vaccine", vaccineCount, 2)
+        val vaccines = antiPacketStore.getPropagationWindow(vaccineOffset, 2)
+        val relayOffset = manager.nextBackgroundOffset("$peer:relay", relays.size, 2)
+        for (vaccine in vaccines) {
+            if (!manager.isNodeVerified(peer) || !manager.hasBackgroundCapacity(peer) ||
+                !manager.sendBytesToNode(peer, vaccine.toBytes(), NearbyManager.SendPriority.BACKGROUND)) break
+        }
+        for (relay in relays.drop(relayOffset).take(2)) {
+            if (!manager.isNodeVerified(peer) || !manager.hasBackgroundCapacity(peer) ||
+                !manager.sendBytesToNode(peer, relay.toBytes(), NearbyManager.SendPriority.BACKGROUND)) break
         }
     }
 }

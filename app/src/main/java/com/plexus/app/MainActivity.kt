@@ -2105,7 +2105,7 @@ class MainActivity : ComponentActivity() {
 
                     val nearbyManager =
                         remember(
-                            identity.nodeId
+                            identity.nodeId, identity.displayName
                         ) {
 
                             NearbyManager(
@@ -2114,9 +2114,7 @@ class MainActivity : ComponentActivity() {
                                     applicationContext,
 
                                 localEndpointName =
-                                    identity.displayName +
-                                            "-" +
-                                            identity.nodeId.take(8),
+                                    NearbyEndpointName.create(identity.nodeId, identity.displayName),
 
                                 listener =
                                     object :
@@ -3938,8 +3936,9 @@ class MainActivity : ComponentActivity() {
                                                                      */
                                                                         manager
                                                                             .broadcastBytes(
-                                                                                deliveryAntiPacket
-                                                                                    .toBytes()
+                                                                                bytes = deliveryAntiPacket
+                                                                                    .toBytes(),
+                                                                                priority = NearbyManager.SendPriority.MESSAGE
                                                                             )
 
 
@@ -4159,7 +4158,7 @@ class MainActivity : ComponentActivity() {
 
 
                     LaunchedEffect(
-                        nearbyPermissionsGranted
+                        nearbyPermissionsGranted, nearbyManager
                     ) {
 
                         if (

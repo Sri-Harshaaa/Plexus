@@ -114,6 +114,9 @@ interface AntiPacketDao {
             System.currentTimeMillis()
     ): List<AntiPacketEntity>
 
+    @Query("SELECT * FROM anti_packets WHERE expiresAt > :now ORDER BY storedAt ASC LIMIT :limit OFFSET :offset")
+    suspend fun getActiveAntiPacketWindow(now: Long, limit: Int, offset: Int): List<AntiPacketEntity>
+
 
 
     /*

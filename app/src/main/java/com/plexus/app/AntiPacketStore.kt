@@ -456,6 +456,11 @@ class AntiPacketStore(private val database: PlexusDatabase) {
             }
     }
 
+    suspend fun getPropagationWindow(offset: Int, limit: Int, now: Long = System.currentTimeMillis()): List<NearbyAntiPacket> {
+        return antiPacketDao.getActiveAntiPacketWindow(now, limit, offset)
+            .map { it.toNearbyAntiPacket() }
+    }
+
 
 
     /*

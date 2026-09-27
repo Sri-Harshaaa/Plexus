@@ -11,6 +11,7 @@ internal class EndpointOutbox(val session: Long) {
     var inFlight: Transfer? = null
         private set
     val size: Int get() = queues.sumOf { it.size }
+    val backgroundSize: Int get() = queues[2].size
 
     fun offer(key: String, bytes: ByteArray, priority: Int, now: Long): Boolean {
         require(priority in 0..2)

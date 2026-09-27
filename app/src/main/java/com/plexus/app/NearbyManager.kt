@@ -130,6 +130,7 @@ class NearbyManager(
 
         private const val MAX_START_BACKOFF_MS =
             30_000L
+        private const val IDLE_DISCOVERY_REFRESH_MS = 60_000L
     }
 
 
@@ -199,8 +200,8 @@ class NearbyManager(
         false
 
 
-    private var advertisingGeneration =
-        0L
+    private val advertisingStart = StartAttemptGate()
+    private val advertisingGeneration get() = advertisingStart.generation
 
 
     private var advertisingRetryCount =
@@ -221,8 +222,8 @@ class NearbyManager(
         false
 
 
-    private var discoveryGeneration =
-        0L
+    private val discoveryStart = StartAttemptGate()
+    private val discoveryGeneration get() = discoveryStart.generation
 
 
     private var discoveryRetryCount =
@@ -252,6 +253,9 @@ class NearbyManager(
 
     private var recoveryEpoch =
         0L
+    private val mediumMonitor = NearbyMediumMonitor(appContext, recoveryHandler) { reason ->
+        if (maintainNearbySessions) scheduleNearbyRecovery(reason, 2_000L)
+    }
 
 
     private var scheduledRecoveryRunnable:
@@ -262,6 +266,22 @@ class NearbyManager(
     private var scheduledRestartRunnable:
             Runnable? =
         null
+    private var idleRefreshRunnable: Runnable? = null
+    private fun armIdleRefresh() {
+        if (idleRefreshRunnable != null) return
+        val refresh = object : Runnable {
+            override fun run() {
+                if (!maintainNearbySessions || idleRefreshRunnable !== this) return
+                if (verifiedEndpoints.isEmpty() && pendingEndpoints.isEmpty() &&
+                    scheduledRecoveryRunnable == null && scheduledRestartRunnable == null) {
+                    scheduleNearbyRecovery("idle discovery refresh", 0L)
+                }
+                recoveryHandler.postDelayed(this, IDLE_DISCOVERY_REFRESH_MS)
+            }
+        }
+        idleRefreshRunnable = refresh
+        recoveryHandler.postDelayed(refresh, IDLE_DISCOVERY_REFRESH_MS)
+    }
 
 
     /*
@@ -300,8 +320,23 @@ class NearbyManager(
     private val connectionSessions = mutableMapOf<String, Long>()
     private val recentVaccineTransfers = LinkedHashMap<String, Long>()
     private val receiveBudgets = mutableMapOf<String, ReceiveBudget>()
+    private val backgroundOffsets = mutableMapOf<String, Int>()
+    fun nextBackgroundOffset(peer: String, count: Int, step: Int = 4): Int {
+        if (count == 0) return 0
+        val offset = (backgroundOffsets[peer] ?: 0) % count
+        backgroundOffsets[peer] = (offset + step) % count
+        return offset
+    }
+    fun hasBackgroundCapacity(peer: String): Boolean = nodeIdToEndpoint[peer]?.let {
+        (outboxes[it]?.backgroundSize ?: 8) < 8
+    } ?: false
     private data class ReceiveBudget(var tokens: Double = 128.0, var updatedAt: Long = SystemClock.elapsedRealtime())
     private var lastRecoveryAt = -5_000L
+
+    private val peerRetries = PeerRetryState { SystemClock.elapsedRealtime() }
+    private val peerCooldownState get() = peerRetries.cooldown
+    private val attemptCandidates = mutableMapOf<String, PeerRetryState.Candidate>()
+    private val scheduledCooldownRetries = mutableMapOf<String, Runnable>()
 
     /*
      * =========================================================
@@ -496,7 +531,8 @@ class NearbyManager(
      * =========================================================
      */
 
-    private fun connectionLifecycleCallback() =
+    private fun connectionLifecycleCallback(requestEndpoint: String? = null, requestSession: Long? = null,
+                                            advertisingOwner: Long? = null) =
         object : ConnectionLifecycleCallback() {
             private val ownedSessions = mutableMapOf<String, Long>()
 
@@ -511,11 +547,16 @@ class NearbyManager(
                 }
 
                 if (!maintainNearbySessions) return
+                if (requestEndpoint != null && (endpointId != requestEndpoint ||
+                    connectionSessions[endpointId] != requestSession)) return
+                if (advertisingOwner != null && advertisingOwner != advertisingGeneration) return
                 // Nearby lifecycle events carry only an endpoint ID. Never reuse that ID in
                 // the same callback owner: an old disconnect would otherwise be ambiguous.
                 if (ownedSessions.containsKey(endpointId)) {
                     if (ownedSessions[endpointId] != connectionSessions[endpointId]) {
-                        runCatching { connectionsClient.rejectConnection(endpointId) }
+                        // A stale callback's ID can now belong to a healthy
+                        // replacement session; do not reject that endpoint.
+                        Log.w(TAG, "STALE CONNECTION CALLBACK -> endpoint=$endpointId")
                         scheduleNearbyRecovery("endpoint ID reused by retired callback -> $endpointId")
                     }
                     return
@@ -531,6 +572,14 @@ class NearbyManager(
                     listener.onDisconnected(endpointId)
                 }
                 receiveBudgets[endpointId] = ReceiveBudget()
+                if (endpointId !in attemptCandidates) {
+                    val candidate = peerRetries.found(endpointId, connectionInfo.endpointName)
+                    if (candidate == null || !peerRetries.begin(candidate)) {
+                        runCatching { connectionsClient.rejectConnection(endpointId) }
+                        return
+                    }
+                    attemptCandidates[endpointId] = candidate
+                }
                 val session = ++nextConnectionSession
                 ownedSessions[endpointId] = session
                 connectionSessions[endpointId] = session
@@ -589,8 +638,7 @@ class NearbyManager(
                         payloadCallback(session)
                     )
                     .addOnSuccessListener {
-
-
+                        if (connectionSessions[endpointId] != session) return@addOnSuccessListener
                         Log.d(
                             TAG,
                             "ACCEPTED -> $endpointId"
@@ -600,9 +648,10 @@ class NearbyManager(
                         if (!maintainNearbySessions || connectionSessions[endpointId] != session) return@addOnFailureListener
 
 
-
-                        pendingEndpoints.remove(
-                            endpointId
+                        Log.e(
+                            TAG,
+                            "ACCEPT CONNECTION FAILED -> $endpointId",
+                            exception
                         )
 
 
@@ -616,10 +665,9 @@ class NearbyManager(
                         )
 
 
-                        scheduleNearbyRecovery(
-                            reason =
-                                "accept connection failure -> $endpointId"
-                        )
+                        val status = (exception as? com.google.android.gms.common.api.ApiException)?.statusCode
+                        invalidateEndpoint(endpointId, "accept connection failure", status != null &&
+                            NearbyFailureClassifier.forStatus(status) == NearbyRecoveryPolicy.MEDIUM_REFRESH)
                     }
             }
 
@@ -681,24 +729,11 @@ class NearbyManager(
 
 
                     else -> {
-                        clearOutgoingForEndpoint(endpointId)
-                        connectionWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
-                        connectionSessions.remove(endpointId)
-
-
-
-                        connectedEndpoints.remove(
-                            endpointId
-                        )
-
-
-                        removeIdentityMapping(
-                            endpointId
-                        )
-
-
-                        clearAuthentication(
-                            endpointId
+                        Log.e(
+                            TAG,
+                            "CONNECTION REJECTED/FAILED -> " +
+                                    "$endpointId | " +
+                                    "status=${result.status.statusCode}"
                         )
 
 
@@ -711,10 +746,8 @@ class NearbyManager(
                         )
 
 
-                        scheduleNearbyRecovery(
-                            reason =
-                                "connection result failure -> $endpointId"
-                        )
+                        invalidateEndpoint(endpointId, "connection result failure",
+                            NearbyFailureClassifier.forStatus(result.status.statusCode) == NearbyRecoveryPolicy.MEDIUM_REFRESH)
                     }
                 }
             }
@@ -731,52 +764,7 @@ class NearbyManager(
 
                 if (!maintainNearbySessions || ownedSessions[endpointId] != connectionSessions[endpointId] ||
                     !connectionSessions.containsKey(endpointId)) return
-                connectionSessions.remove(endpointId)
-                connectionWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
-                receiveBudgets.remove(endpointId)
-
-
-
-                connectedEndpoints.remove(
-                    endpointId
-                )
-
-
-                pendingEndpoints.remove(
-                    endpointId
-                )
-
-
-                clearAuthentication(
-                    endpointId
-                )
-
-
-                clearOutgoingForEndpoint(
-                    endpointId
-                )
-
-
-                removeIdentityMapping(
-                    endpointId
-                )
-
-
-                Log.d(
-                    TAG,
-                    "DISCONNECTED -> $endpointId"
-                )
-
-
-                listener.onDisconnected(
-                    endpointId
-                )
-
-
-                scheduleNearbyRecovery(
-                    reason =
-                        "endpoint disconnected -> $endpointId"
-                )
+                invalidateEndpoint(endpointId, "endpoint disconnected", recoverMedium = true)
             }
         }
 
@@ -788,7 +776,7 @@ class NearbyManager(
      * =========================================================
      */
 
-    private val endpointDiscoveryCallback =
+    private fun endpointDiscoveryCallback(generation: Long) =
         object :
             EndpointDiscoveryCallback() {
 
@@ -803,6 +791,11 @@ class NearbyManager(
                 }
 
                 if (!maintainNearbySessions) return
+                if (generation != discoveryGeneration) return
+                val candidate = peerRetries.found(endpointId, info.endpointName) ?: return
+                discoveredEndpointNames.keys.removeAll { old ->
+                    old != endpointId && NearbyEndpointName.key(discoveredEndpointNames.getValue(old)) == candidate.key
+                }
 
 
                 discoveredEndpointNames[
@@ -847,6 +840,15 @@ class NearbyManager(
                     return
                 }
 
+                val endpointName = info.endpointName
+                if (peerCooldownState.isCoolingDown(candidate.key)) {
+                    Log.d(TAG, "FOUND SKIPPED - PEER IN COOLDOWN -> $endpointName")
+                    val expireAt = peerCooldownState.getExpireAt(candidate.key)
+                    if (expireAt != null) {
+                        scheduleCooldownRetry(endpointId, endpointName, expireAt)
+                    }
+                    return
+                }
 
                 /*
                  * Deterministic initiator selection.
@@ -855,8 +857,7 @@ class NearbyManager(
                  * requesting the same connection.
                  */
                 if (
-                    localEndpointName <
-                    info.endpointName
+                    NearbyEndpointName.initiates(localEndpointName, info.endpointName)
                 ) {
 
 
@@ -895,12 +896,13 @@ class NearbyManager(
                     return
                 }
 
-
-
-                discoveredEndpointNames.remove(
+                if (!maintainNearbySessions || generation != discoveryGeneration) return
+                val endpointName = discoveredEndpointNames.remove(
                     endpointId
                 )
-
+                val lostCandidate = peerRetries.candidate(endpointId)
+                peerRetries.lost(endpointId)
+                lostCandidate?.let { scheduledCooldownRetries.remove(it.key)?.let(recoveryHandler::removeCallbacks) }
 
                 Log.d(
                     TAG,
@@ -923,6 +925,8 @@ class NearbyManager(
      */
 
     fun startAdvertising() {
+        mediumMonitor.start()
+        armIdleRefresh()
 
 
         maintainNearbySessions =
@@ -941,6 +945,8 @@ class NearbyManager(
      */
 
     fun startDiscovery() {
+        mediumMonitor.start()
+        armIdleRefresh()
 
 
         maintainNearbySessions =
@@ -980,8 +986,7 @@ class NearbyManager(
         }
 
 
-        advertisingGeneration += 1L
-        val generation = advertisingGeneration
+        val generation = advertisingStart.begin()
 
 
         Log.d(
@@ -1005,7 +1010,7 @@ class NearbyManager(
 
                 if (
                     !maintainNearbySessions ||
-                    generation != advertisingGeneration
+                    generation != advertisingGeneration || advertisingActive || scheduledAdvertisingWatchdog == null
                 ) {
 
                     return@Runnable
@@ -1016,6 +1021,8 @@ class NearbyManager(
                     TAG,
                     "ADVERTISING START TIMEOUT generation=$generation"
                 )
+                if (!advertisingStart.complete(generation)) return@Runnable
+                advertisingStart.invalidate()
 
 
                 scheduledAdvertisingWatchdog =
@@ -1043,14 +1050,14 @@ class NearbyManager(
             )
 
 
-        connectionsClient
+        try { connectionsClient
             .startAdvertising(
 
                 localEndpointName,
 
                 serviceId,
 
-                connectionLifecycleCallback(),
+                connectionLifecycleCallback(advertisingOwner = generation),
 
                 options
             )
@@ -1059,7 +1066,7 @@ class NearbyManager(
 
                 if (
                     !maintainNearbySessions ||
-                    generation != advertisingGeneration
+                    generation != advertisingGeneration || !advertisingStart.complete(generation)
                 ) {
 
                     return@addOnSuccessListener
@@ -1101,7 +1108,7 @@ class NearbyManager(
 
                 if (
                     !maintainNearbySessions ||
-                    generation != advertisingGeneration
+                    generation != advertisingGeneration || !advertisingStart.complete(generation)
                 ) {
 
                     return@addOnFailureListener
@@ -1145,6 +1152,15 @@ class NearbyManager(
 
                 scheduleAdvertisingRetry()
             }
+        } catch (exception: Exception) {
+            if (advertisingStart.complete(generation)) {
+                scheduledAdvertisingWatchdog?.let(recoveryHandler::removeCallbacks)
+                scheduledAdvertisingWatchdog = null
+                advertisingActive = false
+                Log.e(TAG, "ADVERTISING START THREW generation=$generation", exception)
+                scheduleAdvertisingRetry()
+            }
+        }
     }
 
 
@@ -1159,11 +1175,11 @@ class NearbyManager(
         }
 
 
-        advertisingRetryCount += 1
+        advertisingRetryCount = minOf(advertisingRetryCount + 1, 10)
 
 
         val backoff =
-            (BASE_START_BACKOFF_MS * advertisingRetryCount)
+            (BASE_START_BACKOFF_MS * (1L shl (advertisingRetryCount - 1)))
                 .coerceAtMost(
                     MAX_START_BACKOFF_MS
                 )
@@ -1231,8 +1247,7 @@ class NearbyManager(
         }
 
 
-        discoveryGeneration += 1L
-        val generation = discoveryGeneration
+        val generation = discoveryStart.begin()
 
 
         Log.d(
@@ -1256,7 +1271,7 @@ class NearbyManager(
 
                 if (
                     !maintainNearbySessions ||
-                    generation != discoveryGeneration
+                    generation != discoveryGeneration || discoveryActive || scheduledDiscoveryWatchdog == null
                 ) {
 
                     return@Runnable
@@ -1271,6 +1286,8 @@ class NearbyManager(
 
                 scheduledDiscoveryWatchdog =
                     null
+                if (!discoveryStart.complete(generation)) return@Runnable
+                discoveryStart.invalidate()
 
 
                 connectionsClient
@@ -1294,12 +1311,12 @@ class NearbyManager(
             )
 
 
-        connectionsClient
+        try { connectionsClient
             .startDiscovery(
 
                 serviceId,
 
-                endpointDiscoveryCallback,
+                endpointDiscoveryCallback(generation),
 
                 options
             )
@@ -1308,7 +1325,7 @@ class NearbyManager(
 
                 if (
                     !maintainNearbySessions ||
-                    generation != discoveryGeneration
+                    generation != discoveryGeneration || !discoveryStart.complete(generation)
                 ) {
 
                     return@addOnSuccessListener
@@ -1350,7 +1367,7 @@ class NearbyManager(
 
                 if (
                     !maintainNearbySessions ||
-                    generation != discoveryGeneration
+                    generation != discoveryGeneration || !discoveryStart.complete(generation)
                 ) {
 
                     return@addOnFailureListener
@@ -1394,6 +1411,15 @@ class NearbyManager(
 
                 scheduleDiscoveryRetry()
             }
+        } catch (exception: Exception) {
+            if (discoveryStart.complete(generation)) {
+                scheduledDiscoveryWatchdog?.let(recoveryHandler::removeCallbacks)
+                scheduledDiscoveryWatchdog = null
+                discoveryActive = false
+                Log.e(TAG, "DISCOVERY START THREW generation=$generation", exception)
+                scheduleDiscoveryRetry()
+            }
+        }
     }
 
 
@@ -1408,11 +1434,11 @@ class NearbyManager(
         }
 
 
-        discoveryRetryCount += 1
+        discoveryRetryCount = minOf(discoveryRetryCount + 1, 10)
 
 
         val backoff =
-            (BASE_START_BACKOFF_MS * discoveryRetryCount)
+            (BASE_START_BACKOFF_MS * (1L shl (discoveryRetryCount - 1)))
                 .coerceAtMost(
                     MAX_START_BACKOFF_MS
                 )
@@ -1583,6 +1609,9 @@ class NearbyManager(
                  * legitimately be in the middle of a connection handshake.
                  */
                 discoveredEndpointNames.clear()
+                peerRetries.clearCandidates()
+                scheduledCooldownRetries.values.forEach(recoveryHandler::removeCallbacks)
+                scheduledCooldownRetries.clear()
 
 
                 stopAdvertising()
@@ -1651,6 +1680,30 @@ class NearbyManager(
 
 
 
+    private fun scheduleCooldownRetry(endpointId: String, endpointName: String, expireAt: Long) {
+        val candidate = peerRetries.candidate(endpointId) ?: return
+        val plan = PeerRetryState.Retry(candidate, expireAt)
+        scheduledCooldownRetries.remove(candidate.key)?.let(recoveryHandler::removeCallbacks)
+        val retryRunnable = object : Runnable {
+            override fun run() {
+                if (scheduledCooldownRetries[candidate.key] !== this) return
+                scheduledCooldownRetries.remove(candidate.key)
+                if (!maintainNearbySessions || !peerRetries.ready(plan)) return
+                if (endpointId in connectedEndpoints || endpointId in pendingEndpoints) return
+                if (NearbyEndpointName.initiates(localEndpointName, endpointName)) {
+                    Log.d(TAG, "PEER RETRY -> endpoint=$endpointId name=$endpointName candidate=${candidate.generation}")
+                    connect(endpointId, endpointName)
+                } else {
+                    // A passive node also needs a fresh discovery/advertisement if
+                    // its initiator disappeared. Never disconnect other live peers.
+                    scheduleNearbyRecovery("passive peer retry -> $endpointId")
+                }
+            }
+        }
+        scheduledCooldownRetries[candidate.key] = retryRunnable
+        recoveryHandler.postDelayed(retryRunnable, maxOf(0L, expireAt - SystemClock.elapsedRealtime()))
+    }
+
     /*
      * =========================================================
      * CONNECT
@@ -1684,18 +1737,23 @@ class NearbyManager(
         }
 
 
+        val candidate = peerRetries.candidate(endpointId) ?: return
+        if (!peerRetries.begin(candidate)) return
+        attemptCandidates[endpointId] = candidate
         pendingEndpoints.add(
             endpointId
         )
 
 
+        val session = ++nextConnectionSession
+        connectionSessions[endpointId] = session
         armConnectionWatchdog(endpointId)
         val requestWatchdog = connectionWatchdogs[endpointId]
 
         Log.d(
             TAG,
             "REQUEST CONNECTION -> " +
-                    "$endpointName | $endpointId"
+                    "$endpointName | $endpointId | attempt=$session candidate=${candidate.generation} local=$localEndpointName"
         )
 
 
@@ -1706,11 +1764,11 @@ class NearbyManager(
 
                 endpointId,
 
-                connectionLifecycleCallback()
+                connectionLifecycleCallback(endpointId, session)
             )
             .addOnSuccessListener {
 
-
+                if (!maintainNearbySessions || connectionSessions[endpointId] != session) return@addOnSuccessListener
                 Log.d(
                     TAG,
                     "REQUEST SENT -> $endpointId"
@@ -1718,14 +1776,12 @@ class NearbyManager(
             }
             .addOnFailureListener { exception ->
                 if (!maintainNearbySessions || connectionWatchdogs[endpointId] !== requestWatchdog) return@addOnFailureListener
-                connectionWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
 
-
-
-                pendingEndpoints.remove(
-                    endpointId
+                Log.e(
+                    TAG,
+                    "CONNECTION ATTEMPT FAILED -> endpoint=$endpointId",
+                    exception
                 )
-
 
                 listener.onError(
 
@@ -1736,11 +1792,9 @@ class NearbyManager(
                         exception
                 )
 
-
-                scheduleNearbyRecovery(
-                    reason =
-                        "request connection failure -> $endpointId"
-                )
+                val status = (exception as? com.google.android.gms.common.api.ApiException)?.statusCode
+                invalidateEndpoint(endpointId, "request connection failure", status != null &&
+                    NearbyFailureClassifier.forStatus(status) == NearbyRecoveryPolicy.MEDIUM_REFRESH)
             }
     }
 
@@ -2144,6 +2198,7 @@ class NearbyManager(
         // Only a valid live challenge proof may replace a route for this node.
         val previousEndpoint = peerRoutes.promote(endpointId)
         if (previousEndpoint != null) {
+            attemptCandidates.remove(previousEndpoint)
             connectionWatchdogs.remove(previousEndpoint)?.let(recoveryHandler::removeCallbacks)
             clearAuthentication(previousEndpoint)
             clearOutgoingForEndpoint(previousEndpoint)
@@ -2156,6 +2211,13 @@ class NearbyManager(
         verifiedEndpoints.add(
             endpointId
         )
+
+        val candidate = attemptCandidates[endpointId]
+        if (candidate != null) {
+            peerRetries.authenticated(candidate)
+            scheduledCooldownRetries.remove(candidate.key)?.let(recoveryHandler::removeCallbacks)
+            Log.d(TAG, "PEER CONNECTION BACKOFF RESET -> verified=${proofPacket.responderNodeId.take(8)} name=${candidate.name}")
+        }
 
 
         Log.d(
@@ -2485,7 +2547,7 @@ class NearbyManager(
         if (!box.matches(transfer)) return
         Log.w(TAG, "PAYLOAD TRANSFER ABORTED -> $endpointId | payload=${transfer.payloadId} | $reason")
         // Invalidate before cancelPayload: Google may deliver cancellation immediately.
-        invalidateEndpoint(endpointId, "stale transfer")
+        invalidateEndpoint(endpointId, "stale transfer", recoverMedium = true)
         runCatching { connectionsClient.cancelPayload(transfer.payloadId) }
     }
 
@@ -2503,7 +2565,9 @@ class NearbyManager(
         recoveryHandler.postDelayed(watchdog, 30_000L)
     }
 
-    private fun invalidateEndpoint(endpointId: String, reason: String) {
+    private fun invalidateEndpoint(endpointId: String, reason: String, recoverMedium: Boolean = false) {
+        val candidate = attemptCandidates.remove(endpointId) ?: peerRetries.candidate(endpointId)
+
         clearOutgoingForEndpoint(endpointId)
         connectionWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
         connectionSessions.remove(endpointId)
@@ -2514,7 +2578,20 @@ class NearbyManager(
         removeIdentityMapping(endpointId)
         runCatching { connectionsClient.disconnectFromEndpoint(endpointId) }
         listener.onDisconnected(endpointId)
-        scheduleNearbyRecovery("$reason -> $endpointId")
+
+        Log.d(TAG, "ENDPOINT RETIRED -> $endpointId | reason=$reason")
+
+        if (candidate != null) {
+            val retry = peerRetries.failed(candidate)
+            val delay = (peerCooldownState.getExpireAt(candidate.key) ?: SystemClock.elapsedRealtime()) - SystemClock.elapsedRealtime()
+            Log.d(TAG, "PEER CONNECTION BACKOFF -> key=${candidate.key} name=${candidate.name} failures=${peerCooldownState.failureCount(candidate.key)} delay=$delay ms policy=${if (recoverMedium) "MEDIUM_REFRESH" else "ENDPOINT"}")
+            if (retry != null) scheduleCooldownRetry(retry.candidate.endpoint, retry.candidate.name, retry.deadline)
+            else if (verifiedEndpoints.isEmpty()) scheduleNearbyRecovery("candidate lost -> $endpointId", maxOf(5_000L, delay))
+            if (peerCooldownState.failureCount(candidate.key) >= 3 && verifiedEndpoints.isEmpty()) {
+                scheduleNearbyRecovery("repeated endpoint failure -> $endpointId", maxOf(5_000L, delay))
+            }
+        }
+        if (recoverMedium) scheduleNearbyRecovery(reason)
     }
 
     private fun clearOutgoingForEndpoint(endpointId: String) {
@@ -2579,7 +2656,7 @@ class NearbyManager(
             false
 
 
-        advertisingGeneration += 1L
+        advertisingStart.invalidate()
 
 
         scheduledAdvertisingWatchdog
@@ -2623,7 +2700,7 @@ class NearbyManager(
             false
 
 
-        discoveryGeneration += 1L
+        discoveryStart.invalidate()
 
 
         scheduledDiscoveryWatchdog
@@ -2687,6 +2764,12 @@ class NearbyManager(
         connectionSessions.clear()
         receiveBudgets.clear()
         recentVaccineTransfers.clear()
+        backgroundOffsets.clear()
+        peerCooldownState.clearAll()
+        peerRetries.clear()
+        attemptCandidates.clear()
+        scheduledCooldownRetries.values.forEach(recoveryHandler::removeCallbacks)
+        scheduledCooldownRetries.clear()
     }
 
 
@@ -2701,6 +2784,9 @@ class NearbyManager(
          */
         maintainNearbySessions =
             false
+        mediumMonitor.stop()
+        idleRefreshRunnable?.let(recoveryHandler::removeCallbacks)
+        idleRefreshRunnable = null
 
 
         recoveryEpoch +=
