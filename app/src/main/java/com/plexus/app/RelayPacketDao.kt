@@ -54,6 +54,9 @@ interface RelayPacketDao {
         packetId: String
     ): RelayPacketEntity?
 
+    @Query("UPDATE relay_packets SET originSigningPublicKey = :key, originSignature = :signature WHERE packetId = :packetId AND sourceNodeId = :localNodeId AND originSignature = ''")
+    suspend fun signLegacyLocal(packetId: String, localNodeId: String, key: String, signature: String): Int
+
 
 
     /*
@@ -100,6 +103,14 @@ interface RelayPacketDao {
         now: Long =
             System.currentTimeMillis()
     ): List<RelayPacketEntity>
+
+    @Query("""
+        SELECT * FROM relay_packets
+        WHERE expiresAt > :now AND (originSignature != '' OR sourceNodeId = :localNodeId)
+        ORDER BY CASE WHEN sourceNodeId = :localNodeId THEN 0 ELSE 1 END, storedAt ASC
+        LIMIT :limit OFFSET :offset
+    """)
+    suspend fun getInternetUploadPage(localNodeId: String, now: Long, limit: Int, offset: Int): List<RelayPacketEntity>
 
 
 
@@ -184,10 +195,11 @@ interface RelayPacketDao {
 
     /*
      * =========================================================
-     * DELETE EXPIRED PACKETS
+     * DELETE EXPIRED OR INCOMPATIBLE LEGACY RELAY PACKETS
      * =========================================================
      *
-     * TTL is the REAL lifetime limiter in Plexus.
+     * Foreign unsigned rows cannot be upgraded: only their original sender can sign them.
+     * Local unsigned rows remain eligible for a lazy signed upgrade.
      *
      * Hop count is NOT used here.
      */
@@ -195,13 +207,10 @@ interface RelayPacketDao {
     @Query(
         """
         DELETE FROM relay_packets
-        WHERE expiresAt <= :now
+        WHERE expiresAt <= :now OR (originSignature = '' AND sourceNodeId != :localNodeId)
         """
     )
-    suspend fun deleteExpiredPackets(
-        now: Long =
-            System.currentTimeMillis()
-    ): Int
+    suspend fun deleteUnusablePackets(now: Long, localNodeId: String): Int
 
 
 

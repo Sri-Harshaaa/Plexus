@@ -17,7 +17,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ConnectionRequestEntity::class,
         ConversationStateEntity::class
     ],
-    version = 9,
+    version = 10,
     exportSchema = false
 )
 abstract class PlexusDatabase :
@@ -484,6 +484,13 @@ abstract class PlexusDatabase :
                 }
             }
 
+        private val MIGRATION_9_10 = object : Migration(9, 10) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                database.execSQL("ALTER TABLE relay_packets ADD COLUMN originSigningPublicKey TEXT NOT NULL DEFAULT ''")
+                database.execSQL("ALTER TABLE relay_packets ADD COLUMN originSignature TEXT NOT NULL DEFAULT ''")
+            }
+        }
+
 
 
         /*
@@ -515,7 +522,7 @@ abstract class PlexusDatabase :
                             /*
                              * Existing installations can upgrade:
                              *
-                             * 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9
+                             * 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 -> 10
                              *
                              * without deleting existing data.
                              */
@@ -535,7 +542,8 @@ abstract class PlexusDatabase :
 
                                 MIGRATION_7_8,
 
-                                MIGRATION_8_9
+                                MIGRATION_8_9,
+                                MIGRATION_9_10
                             )
 
 

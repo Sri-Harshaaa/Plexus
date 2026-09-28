@@ -87,8 +87,11 @@ import androidx.compose.ui.window.Dialog
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.plexus.app.ui.theme.PlexusTheme
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -262,6 +265,10 @@ class MainActivity : ComponentActivity() {
                         savedDisplayName
                             .orEmpty()
 
+                    val identity = remember(activeDisplayName) {
+                        IdentityManager.getOrCreateIdentity(displayName = activeDisplayName)
+                    }
+
 
                     val database =
                         remember {
@@ -295,11 +302,9 @@ class MainActivity : ComponentActivity() {
 
 
                     val meshRelayStore =
-                        remember(
-                            relayPacketDao
-                        ) {
+                        remember(relayPacketDao, identity.nodeId) {
 
-                            MeshRelayStore(database)
+                            MeshRelayStore(database, identity)
                         }
 
 
@@ -313,10 +318,11 @@ class MainActivity : ComponentActivity() {
                     val antiPacketStore =
                         remember(
                             antiPacketDao,
-                            relayPacketDao
+                            relayPacketDao,
+                            identity.nodeId
                         ) {
 
-                            AntiPacketStore(database)
+                            AntiPacketStore(database, identity.nodeId)
                         }
 
 
@@ -474,19 +480,7 @@ class MainActivity : ComponentActivity() {
 
                     val coroutineScope =
                         rememberCoroutineScope()
-
-
-                    val identity =
-                        remember(
-                            activeDisplayName
-                        ) {
-
-                            IdentityManager
-                                .getOrCreateIdentity(
-                                    displayName =
-                                        activeDisplayName
-                                )
-                        }
+                    val outgoingSendMutex = remember { Mutex() }
 
 
                     /*
@@ -909,6 +903,7 @@ class MainActivity : ComponentActivity() {
 
 
                     val internetSyncJob = remember { arrayOfNulls<kotlinx.coroutines.Job>(1) }
+                    val internetUploadOffset = remember { intArrayOf(0) }
 
                     val internetManager =
                         remember(
@@ -977,19 +972,26 @@ class MainActivity : ComponentActivity() {
                                                  * already durable in Room.
                                                  *
                                                  * Once server authentication succeeds again, offer
-                                                 * only packets originally created by THIS node to
-                                                 * the backend.
+                                                 * signed local and foreign relay packets to the
+                                                 * backend in bounded rotating windows.
                                                  *
                                                  * Never delete them merely because the relay accepts
                                                  * the upload. A valid signed delivery anti-packet
                                                  * remains the authority that kills the local copy.
                                                  */
-                                                    val pendingInternetPackets =
+                                                    var pendingInternetPackets =
                                                         meshRelayStore
                                                             .getInternetUploadCandidates(
                                                                 localNodeId =
-                                                                    identity.nodeId
+                                                                    identity.nodeId,
+                                                                offset = internetUploadOffset[0]
                                                             )
+                                                    if (pendingInternetPackets.isEmpty() && internetUploadOffset[0] > 0) {
+                                                        internetUploadOffset[0] = 0
+                                                        pendingInternetPackets = meshRelayStore.getInternetUploadCandidates(identity.nodeId)
+                                                    }
+                                                    internetUploadOffset[0] = if (pendingInternetPackets.size < 32) 0
+                                                        else internetUploadOffset[0] + pendingInternetPackets.size
 
 
                                                     var retriedPacketCount =
@@ -1365,9 +1367,11 @@ class MainActivity : ComponentActivity() {
                                      * RECEIVE ENCRYPTED MESH PACKET FROM INTERNET
                                      * =====================================================
                                      *
-                                     * The server has already authenticated the socket that
-                                     * submitted the outer sourceNodeId. We still do NOT
-                                     * trust plaintext from the server:
+                                     * AWS authenticates the current WebSocket uploader. A packet
+                                     * may originate from another Plexus node: AWS independently
+                                     * verifies the origin nodeId/public-key binding and ECDSA
+                                     * signature, so uploader and origin may legitimately differ.
+                                     * We still do NOT trust plaintext from the server:
                                      *
                                      * - packet structure is validated by NearbyMeshPacket
                                      * - final sender must be a saved contact
@@ -1406,12 +1410,7 @@ class MainActivity : ComponentActivity() {
                                             }
 
 
-                                            /*
-                                         * The current backend routes directly to the final
-                                         * destination. Internet relay-upload support is a
-                                         * separate protocol concern, so reject anything that
-                                         * somehow arrives for another node.
-                                         */
+                                            /* The Internet relay routes to the final destination. */
                                             if (
                                                 packet.destinationNodeId !=
                                                 identity.nodeId
@@ -4033,6 +4032,8 @@ class MainActivity : ComponentActivity() {
 
                                                             MeshRelayStore.StoreResult.STORED -> {
 
+                                                                internetManagerHolder[0]?.sendMeshPacket(meshPacket)
+
 
                                                                 Log.d(
                                                                     "PlexusNearby",
@@ -5556,10 +5557,9 @@ class MainActivity : ComponentActivity() {
 
 
                                         val readReceiptMeshPacket =
-                                            NearbyMeshPacket
-                                                .create(
-                                                    encryptedReadReceipt
-                                                )
+                                            withContext(Dispatchers.IO) {
+                                                NearbyMeshPacket.create(encryptedReadReceipt, identity)
+                                            }
 
 
                                         val storeResult =
@@ -5905,13 +5905,6 @@ class MainActivity : ComponentActivity() {
                                                         )
 
 
-                                                val meshPacket =
-                                                    NearbyMeshPacket
-                                                        .create(
-                                                            encryptedPacket
-                                                        )
-
-
                                                 val outgoingMessage =
                                                     MessageEntity(
 
@@ -5945,8 +5938,6 @@ class MainActivity : ComponentActivity() {
 
 
                                                     try {
-
-
                                                         /*
                                                      * Persist FIRST.
                                                      *
@@ -5954,13 +5945,22 @@ class MainActivity : ComponentActivity() {
                                                      * packet survives and can be forwarded
                                                      * on a later encounter.
                                                      */
-                                                        val storeResult = database.withTransaction {
-                                                            val result = meshRelayStore.store(meshPacket, locallyCreated = true)
-                                                            if (result == MeshRelayStore.StoreResult.STORED ||
-                                                                result == MeshRelayStore.StoreResult.DUPLICATE) {
-                                                                messageDao.insertMessage(outgoingMessage)
+                                                        outgoingSendMutex.lock()
+                                                        val (meshPacket, storeResult) = try {
+                                                            val packet = withContext(Dispatchers.IO) {
+                                                                NearbyMeshPacket.create(encryptedPacket, identity)
                                                             }
-                                                            result
+                                                            val result = database.withTransaction {
+                                                                val stored = meshRelayStore.store(packet, locallyCreated = true)
+                                                                if (stored == MeshRelayStore.StoreResult.STORED ||
+                                                                    stored == MeshRelayStore.StoreResult.DUPLICATE) {
+                                                                    messageDao.insertMessage(outgoingMessage)
+                                                                }
+                                                                stored
+                                                            }
+                                                            packet to result
+                                                        } finally {
+                                                            outgoingSendMutex.unlock()
                                                         }
 
 

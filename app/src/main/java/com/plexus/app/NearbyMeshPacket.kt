@@ -24,7 +24,9 @@ data class NearbyMeshPacket(
      *
      * Relays never decrypt this.
      */
-    val encryptedPayload: String
+    val encryptedPayload: String,
+    val originSigningPublicKey: String,
+    val originSignature: String
 
 ) {
 
@@ -94,6 +96,8 @@ data class NearbyMeshPacket(
                     "encryptedPayload",
                     encryptedPayload
                 )
+                put("originSigningPublicKey", originSigningPublicKey)
+                put("originSignature", originSignature)
             }
 
 
@@ -143,6 +147,25 @@ data class NearbyMeshPacket(
     fun forwardedCopy(now: Long = System.currentTimeMillis()): NearbyMeshPacket? {
         val next = MeshPolicy.nextHop(hopCount, expiresAt, now) ?: return null
         return copy(hopCount = next)
+    }
+
+    internal fun originBytes(): ByteArray {
+        val fields = listOf(packetId, sourceNodeId, destinationNodeId,
+            createdAt.toString(), expiresAt.toString(), encryptedPayload)
+        return ("PLEXUS_MESH_ORIGIN_V1|" + fields.joinToString("") {
+            "${it.toByteArray(Charsets.UTF_8).size}:$it|"
+        }).toByteArray(Charsets.UTF_8)
+    }
+
+    fun hasValidOrigin(): Boolean = originSigningPublicKey.length <= 512 &&
+        originSignature.length <= 256 &&
+        PeerIdentityVerifier.isValidIdentity(sourceNodeId, originSigningPublicKey) &&
+        IdentityCrypto.verify(originBytes(), originSignature, originSigningPublicKey)
+
+    fun signAs(identity: PlexusIdentity): NearbyMeshPacket {
+        require(sourceNodeId == identity.nodeId)
+        val unsigned = copy(originSigningPublicKey = identity.signingPublicKey, originSignature = "")
+        return unsigned.copy(originSignature = IdentityCrypto.sign(unsigned.originBytes(), identity.nodeId))
     }
 
 
@@ -198,6 +221,8 @@ data class NearbyMeshPacket(
 
             encryptedChatPacket:
             NearbyEncryptedChatPacket,
+
+            identity: PlexusIdentity,
 
             lifetimeMs: Long =
                 PacketReplayGuard.MESSAGE_TTL_MS
@@ -285,9 +310,10 @@ data class NearbyMeshPacket(
                 hopCount =
                     0L,
 
-                encryptedPayload =
-                    encodedPayload
-            )
+                encryptedPayload = encodedPayload,
+                originSigningPublicKey = "",
+                originSignature = ""
+            ).signAs(identity)
         }
 
 
@@ -388,6 +414,8 @@ data class NearbyMeshPacket(
                     json.optString(
                         "encryptedPayload"
                     )
+                val originSigningPublicKey = json.optString("originSigningPublicKey")
+                val originSignature = json.optString("originSignature")
 
 
 
@@ -402,7 +430,8 @@ data class NearbyMeshPacket(
                     createdAt <= 0L ||
                     expiresAt <= createdAt ||
                     hopCount !in 0..MeshPolicy.MAX_MESH_HOPS ||
-                    encryptedPayload.isBlank()
+                    encryptedPayload.isBlank() ||
+                    originSigningPublicKey.isBlank() || originSignature.isBlank()
                 ) {
 
                     return null
@@ -431,8 +460,9 @@ data class NearbyMeshPacket(
                         hopCount =
                             hopCount,
 
-                        encryptedPayload =
-                            encryptedPayload
+                        encryptedPayload = encryptedPayload,
+                        originSigningPublicKey = originSigningPublicKey,
+                        originSignature = originSignature
                     )
 
 
@@ -496,6 +526,7 @@ data class NearbyMeshPacket(
 
 
 
+                if (!packet.hasValidOrigin()) return null
                 packet
 
 

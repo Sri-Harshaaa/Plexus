@@ -161,6 +161,8 @@ class InternetSessionTest {
             .put("packetId", inner.getString("messageId")).put("sourceNodeId", "a".repeat(64)).put("destinationNodeId", "b".repeat(64))
             .put("createdAt", 1800000000000L).put("expiresAt", 1800086400000L)
             .put("encryptedPayload", Base64.getEncoder().encodeToString(inner.toString().toByteArray()))
+            .put("originSigningPublicKey", "A".repeat(512))
+            .put("originSignature", "A".repeat(256))
         val wire = JSONObject().put("action", "sendPacket").put("requestId", "x".repeat(36)).put("packet", packet)
         assertTrue(wire.toString().toByteArray().size < InternetSession.MAX_WIRE_BYTES - 512)
     }

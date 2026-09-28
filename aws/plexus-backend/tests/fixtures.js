@@ -1,5 +1,5 @@
 import { createHash, generateKeyPairSync, sign, randomUUID } from 'node:crypto';
-import { authBytes, proofBytes, controlBytes, DAY } from '../src/protocol.js';
+import { authBytes, proofBytes, controlBytes, originBytes, DAY } from '../src/protocol.js';
 import { createHandler } from '../src/handler.js';
 
 export function identity() {
@@ -12,8 +12,11 @@ export function message(a, b, now) {
     const packetId = randomUUID();
     const inner = { version: 1, type: 'encrypted_chat', messageId: packetId, senderNodeId: a.nodeId,
         recipientNodeId: b.nodeId, timestamp: now, nonce: Buffer.alloc(12).toString('base64'), ciphertext: Buffer.alloc(32).toString('base64') };
-    return { version: 1, type: 'mesh_message', packetId, sourceNodeId: a.nodeId, destinationNodeId: b.nodeId,
-        createdAt: now, expiresAt: now + DAY, hopCount: 0, encryptedPayload: Buffer.from(JSON.stringify(inner)).toString('base64') };
+    const result = { version: 1, type: 'mesh_message', packetId, sourceNodeId: a.nodeId, destinationNodeId: b.nodeId,
+        createdAt: now, expiresAt: now + DAY, hopCount: 0, encryptedPayload: Buffer.from(JSON.stringify(inner)).toString('base64'),
+        originSigningPublicKey: a.signingPublicKey };
+    result.originSignature = signed(originBytes(result), a);
+    return result;
 }
 export function proof(p, receiver, now) {
     const result = { version: 1, type: 'delivery_anti_packet', messageId: p.packetId, sourceNodeId: p.sourceNodeId,
@@ -53,26 +56,42 @@ export class MemoryStore {
     }
     async rate() { return true; }
     async *online(node) { for (const [id, state] of this.connections) if (state.nodeId === node) yield id; }
-    async queueMessage(item) {
+    async queueMessage(item, uploader) {
         await this.beforeQueue?.();
         const old = this.vaccines.get(item.stableId);
         if (old?.proof || (old && (old.sourceNodeId !== item.sourceNodeId || old.recipientNodeId !== item.destinationNodeId || old.packetDigest !== item.digest))) conflict();
+        const gateways = new Set(old?.gatewayNodeIds ?? []);
+        if (uploader && uploader !== item.sourceNodeId) {
+            if (!gateways.has(uploader) && gateways.size >= 16) conflict();
+            gateways.add(uploader);
+        }
         this.vaccines.set(item.stableId, { sourceNodeId: item.sourceNodeId, recipientNodeId: item.destinationNodeId,
-            packetDigest: item.digest, pendingKey: item.packetKey, createdAt: item.createdAt, expiresAt: item.expiresAt, ttl: item.ttl });
+            packetDigest: item.digest, pendingKey: item.packetKey, createdAt: item.createdAt, expiresAt: item.expiresAt, ttl: item.ttl,
+            gatewayNodeIds: gateways });
         this.packets.set(this.key(item.destinationNodeId, item.packetKey), copy(item));
         this.trace.push('persist');
         await this.afterQueue?.();
     }
     async saveProof(item, previous) {
         const p = item.payload;
+        await this.beforeSaveProof?.();
         const old = this.vaccines.get(p.messageId);
-        if (old && (old.sourceNodeId !== p.sourceNodeId || old.recipientNodeId !== p.recipientNodeId || old.proofDigest !== previous?.proofDigest)) conflict();
+        if (old && (old.sourceNodeId !== p.sourceNodeId || old.recipientNodeId !== p.recipientNodeId || old.proofDigest !== previous?.proofDigest ||
+            JSON.stringify([...(old.gatewayNodeIds ?? [])].sort()) !== JSON.stringify([...(previous?.gatewayNodeIds ?? [])].sort()))) conflict();
         this.vaccines.set(p.messageId, { ...old, sourceNodeId: p.sourceNodeId, recipientNodeId: p.recipientNodeId,
             proof: copy(p), proofDigest: item.digest, expiresAt: p.expiresAt, ttl: item.ttl });
         this.packets.set(this.key(item.destinationNodeId, item.packetKey), copy(item));
+        for (const gateway of old?.gatewayNodeIds ?? []) {
+            if (gateway !== p.sourceNodeId) this.packets.set(this.key(gateway, item.packetKey), { ...copy(item), destinationNodeId: gateway });
+        }
+        await this.afterSaveProof?.();
+    }
+    async queueGatewayProof(item, gateway) {
+        this.packets.set(this.key(gateway, item.packetKey), { ...copy(item), destinationNodeId: gateway });
     }
     async deletePending(node, key) { await this.beforeDelete?.(); this.packets.delete(this.key(node, key)); }
     async saveControl(item, markerKey) {
+        await this.beforeSaveControl?.();
         const key = this.key(item.destinationNodeId, markerKey);
         if (this.packets.has(key)) conflict();
         this.packets.set(key, { ...copy(item), packetKey: markerKey, pendingKey: item.packetKey });

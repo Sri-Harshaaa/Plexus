@@ -5,7 +5,7 @@ import android.os.Looper
 import android.util.Log
 import org.json.JSONObject
 
-/** Internet-only adapter. Nearby, Room, identity and application packet formats are unchanged. */
+/** Internet-only adapter; original sender identity is verified by the signed mesh envelope. */
 class InternetManager(
     private val identity: PlexusIdentity,
     private val serverUrl: String,
@@ -40,7 +40,7 @@ class InternetManager(
                         it.destinationNodeId == identity.nodeId && !it.isExpired()
                     }?.let(listener::onMeshPacketReceived)
                     "internet:anti_packet" -> NearbyAntiPacket.fromBytes(bytes)?.takeIf {
-                        it.sourceNodeId == identity.nodeId && !it.isExpired() && it.isCryptographicallyValid()
+                        !it.isExpired()
                     }?.let(listener::onAntiPacketReceived)
                     "internet:connection_request" -> ConnectionRequestPacket.fromBytes(bytes)?.takeIf {
                         it.recipientNodeId == identity.nodeId
@@ -58,7 +58,7 @@ class InternetManager(
         }
         session.start()
     }
-    fun sendMeshPacket(packet: NearbyMeshPacket): Boolean = packet.sourceNodeId == identity.nodeId &&
+    fun sendMeshPacket(packet: NearbyMeshPacket): Boolean = !packet.isExpired() && packet.originSignature.isNotBlank() &&
         offer("message:${packet.packetId}", "sendPacket", packet.toBytes(), packet.expiresAt)
     fun sendAntiPacket(packet: NearbyAntiPacket, background: Boolean = false): Boolean = packet.recipientNodeId == identity.nodeId &&
         offer("proof:${packet.messageId}", "deliveryProof", packet.toBytes(), packet.expiresAt, background)

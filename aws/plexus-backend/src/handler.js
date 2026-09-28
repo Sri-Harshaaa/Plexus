@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { ProtocolError, requireProtocol, identity, signature, authBytes, validatePacket, validateProof,
     row, MAX_WIRE_BYTES, SKEW } from './protocol.js';
-import { conditional } from './store.js';
+import { conditional, transactionRaceCandidate } from './store.js';
 
 const proofMeta = p => ({ type: 'DELIVERY_PROOF', id: p.messageId, source: p.recipientNodeId,
     destination: p.sourceNodeId, priority: 0, event: 'internet:anti_packet' });
@@ -72,12 +72,19 @@ export function createHandler({ store, transport, now = Date.now, log = console 
                 await send(id, 'sync:complete', { cursor: next ? Buffer.from(JSON.stringify(next)).toString('base64url') : '' });
             } finally { await store.unlockSync(id, token); }
         }
-        async function delivered(vaccine, p) {
+        async function delivered(vaccine, p, uploader, digest) {
             requireProtocol(sameBinding(vaccine, p.sourceNodeId, p.destinationNodeId), 'MESSAGE_ID_CONFLICT');
+            requireProtocol(!vaccine?.packetDigest || vaccine.packetDigest === digest, 'MESSAGE_ID_CONFLICT');
             if (!vaccine?.proof) return false;
             // Expired vaccines are never sent. The original message is already expired by then;
             // reusing its ID with a changed timestamp is not a new logical message.
-            if (vaccine.proof.expiresAt > now()) await send(id, 'internet:anti_packet', vaccine.proof);
+            if (vaccine.proof.expiresAt > now()) {
+                if (uploader !== p.sourceNodeId) {
+                    const proofItem = row(vaccine.proof, proofMeta(vaccine.proof));
+                    await store.queueGatewayProof(proofItem, uploader);
+                }
+                await send(id, 'internet:anti_packet', vaccine.proof);
+            }
             await send(id, 'internet:ack', { accepted: true, deliveredAlready: true }, requestId);
             return true;
         }
@@ -125,21 +132,37 @@ export function createHandler({ store, transport, now = Date.now, log = console 
                 else if (ctx.routeKey === 'sendPacket') {
                     const packet = body.packet;
                     const meta = validatePacket(packet, now());
-                    requireProtocol(meta.source === state.nodeId, 'SOURCE_IDENTITY_MISMATCH');
+                    requireProtocol(meta.type === 'MESSAGE' || meta.source === state.nodeId, 'SOURCE_IDENTITY_MISMATCH');
                     let item = row(packet, meta);
                     if (meta.type === 'MESSAGE') {
-                        if (await delivered(await store.vaccine(meta.id), packet)) return { statusCode: 200, body: '' };
-                        try { await store.queueMessage(item); }
-                        catch (e) {
-                            if (!conditional(e)) throw e;
-                            if (await delivered(await store.vaccine(meta.id), packet)) return { statusCode: 200, body: '' };
-                            throw new ProtocolError('MESSAGE_ID_CONFLICT');
+                        if (await delivered(await store.vaccine(meta.id), packet, state.nodeId, item.digest)) return { statusCode: 200, body: '' };
+                        let queued = false;
+                        for (let attempt = 0; attempt < 3; attempt++) {
+                            try { await store.queueMessage(item, state.nodeId); queued = true; break; }
+                            catch (e) {
+                                if (!transactionRaceCandidate(e)) throw e;
+                                const current = await store.vaccine(meta.id);
+                                if (await delivered(current, packet, state.nodeId, item.digest)) return { statusCode: 200, body: '' };
+                                requireProtocol(sameBinding(current, meta.source, meta.destination) &&
+                                    (!current?.packetDigest || current.packetDigest === item.digest), 'MESSAGE_ID_CONFLICT');
+                                const pending = current?.packetDigest === item.digest &&
+                                    await store.pending(meta.destination, item.packetKey);
+                                if (current?.pendingKey === item.packetKey && pending?.packetType === 'MESSAGE' &&
+                                    pending.stableId === meta.id && pending.sourceNodeId === meta.source &&
+                                    pending.destinationNodeId === meta.destination && pending.digest === item.digest) {
+                                    // The original packet is durable. Full sets cap fanout, not uploads.
+                                    if (state.nodeId === meta.source || current.gatewayNodeIds?.has(state.nodeId) ||
+                                        current.gatewayNodeIds?.size >= 16) { queued = true; break; }
+                                    // Another gateway won; retry so this gateway joins the proof set.
+                                } else if (!conditional(e)) throw e;
+                            }
                         }
+                        requireProtocol(queued, 'RETRY_REQUIRED');
                         // A proof may win immediately after queueMessage's atomic reservation/write.
                         const vaccine = await store.vaccine(meta.id);
                         if (vaccine?.proof) {
                             await store.deletePending(meta.destination, item.packetKey);
-                            await delivered(vaccine, packet);
+                            await delivered(vaccine, packet, state.nodeId, item.digest);
                             return { statusCode: 200, body: '' };
                         }
                     } else {
@@ -150,8 +173,9 @@ export function createHandler({ store, transport, now = Date.now, log = console 
                         if (!marker) {
                             try { await store.saveControl(item, markerKey); }
                             catch (e) {
-                                if (!conditional(e)) throw e;
+                                if (!transactionRaceCandidate(e)) throw e;
                                 marker = await store.pending(meta.destination, markerKey);
+                                if (!marker && !conditional(e)) throw e;
                                 requireProtocol(marker, 'RETRY_REQUIRED');
                             }
                         }
@@ -169,21 +193,42 @@ export function createHandler({ store, transport, now = Date.now, log = console 
                     validateProof(packet, now());
                     requireProtocol(packet.recipientNodeId === state.nodeId && packet.recipientSigningPublicKey === state.signingPublicKey, 'PROOF_IDENTITY_MISMATCH');
                     let stored;
+                    let newlyStored = false;
                     for (let attempt = 0; attempt < 3; attempt++) {
                         const previous = await store.vaccine(packet.messageId);
                         requireProtocol(sameBinding(previous, packet.sourceNodeId, packet.recipientNodeId), 'PROOF_IDENTITY_CONFLICT');
                         requireProtocol(!previous?.createdAt || packet.deliveredAt + SKEW >= previous.createdAt, 'PROOF_MESSAGE_MISMATCH');
                         const canonical = previous?.proof ?? packet;
                         requireProtocol(canonical.expiresAt > now(), 'PACKET_EXPIRED');
+                        if (previous?.proof) { stored = canonical; break; }
                         const item = row(canonical, proofMeta(canonical));
-                        try { await store.saveProof(item, previous); stored = canonical; break; }
-                        catch (e) { if (!conditional(e)) throw e; }
+                        try { await store.saveProof(item, previous); stored = canonical; newlyStored = true; break; }
+                        catch (e) {
+                            if (!transactionRaceCandidate(e)) throw e;
+                            if (!conditional(e)) {
+                                const current = await store.vaccine(packet.messageId);
+                                requireProtocol(sameBinding(current, packet.sourceNodeId, packet.recipientNodeId), 'PROOF_IDENTITY_CONFLICT');
+                                requireProtocol(!current?.createdAt || packet.deliveredAt + SKEW >= current.createdAt, 'PROOF_MESSAGE_MISMATCH');
+                                if (current?.proof) { stored = current.proof; break; }
+                                const before = previous?.gatewayNodeIds ?? new Set();
+                                const after = current?.gatewayNodeIds ?? new Set();
+                                const changed = (!previous && !!current) || before.size !== after.size ||
+                                    [...before].some(node => !after.has(node));
+                                if (!changed) throw e;
+                            }
+                        }
                     }
                     requireProtocol(stored, 'RETRY_REQUIRED');
                     const vaccine = await store.vaccine(packet.messageId);
                     if (vaccine?.pendingKey) await store.deletePending(packet.recipientNodeId, vaccine.pendingKey);
-                    await live(packet.sourceNodeId, 'internet:anti_packet', stored);
+                    // The transaction already made every proof notification durable.
                     await send(id, 'internet:ack', { accepted: true, messageId: packet.messageId }, requestId);
+                    if (newlyStored) {
+                        await live(packet.sourceNodeId, 'internet:anti_packet', stored);
+                        for (const gateway of vaccine?.gatewayNodeIds ?? []) {
+                            if (gateway !== packet.sourceNodeId) await live(gateway, 'internet:anti_packet', stored);
+                        }
+                    }
                 }
             }
             return { statusCode: 200, body: '' };

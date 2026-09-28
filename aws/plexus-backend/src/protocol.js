@@ -33,6 +33,9 @@ export function signature(bytes, sig, key) {
 export const authBytes = (n, id, challenge) => Buffer.from(`PLEXUS_SERVER_AUTH_V1|${n}|${id}|${challenge}`, 'utf8');
 export const proofBytes = p => Buffer.from(`PLEXUS_DELIVERY_V1|${p.messageId}|${p.sourceNodeId}|${p.recipientNodeId}|${p.deliveredAt}|${p.expiresAt}`, 'utf8');
 const prefix = value => `${Buffer.byteLength(String(value), 'utf8')}:${value}|`;
+export const originBytes = p => Buffer.from(`PLEXUS_MESH_ORIGIN_V1|${[
+    p.packetId, p.sourceNodeId, p.destinationNodeId, p.createdAt, p.expiresAt, p.encryptedPayload
+].map(prefix).join('')}`, 'utf8');
 export function controlBytes(p) {
     const request = p.type === 'connection_request';
     const fields = request ? ['requestId', 'senderNodeId', 'recipientNodeId', 'senderDisplayName',
@@ -74,6 +77,8 @@ export function validatePacket(p, now) {
             typeof inner.nonce === 'string' && b64.test(inner.nonce) && Buffer.from(inner.nonce, 'base64').length === 12 &&
             typeof inner.ciphertext === 'string' && b64.test(inner.ciphertext) && inner.ciphertext.length <= 24000 &&
             Buffer.from(inner.ciphertext, 'base64').length >= 16, 'INVALID_ENCRYPTED_PAYLOAD');
+        identity(p.sourceNodeId, p.originSigningPublicKey);
+        signature(originBytes(p), p.originSignature, p.originSigningPublicKey);
         return { type: 'MESSAGE', id: p.packetId, source: p.sourceNodeId, destination: p.destinationNodeId,
             event: 'internet:packet', priority: 2 };
     }
@@ -96,7 +101,7 @@ export function validatePacket(p, now) {
 }
 export function row(p, meta) {
     const fields = {
-        MESSAGE: ['packetId', 'sourceNodeId', 'destinationNodeId', 'createdAt', 'expiresAt', 'hopCount', 'encryptedPayload'],
+        MESSAGE: ['packetId', 'sourceNodeId', 'destinationNodeId', 'createdAt', 'expiresAt', 'hopCount', 'encryptedPayload', 'originSigningPublicKey', 'originSignature'],
         DELIVERY_PROOF: ['messageId', 'sourceNodeId', 'recipientNodeId', 'recipientSigningPublicKey', 'deliveredAt', 'expiresAt', 'signature'],
         CONNECTION_REQUEST: ['requestId', 'senderNodeId', 'recipientNodeId', 'senderDisplayName', 'senderSigningPublicKey', 'senderAgreementPublicKey', 'createdAt', 'expiresAt', 'signature'],
         CONNECTION_RESPONSE: ['requestId', 'responseId', 'requesterNodeId', 'responderNodeId', 'response', 'responderDisplayName', 'responderSigningPublicKey', 'responderAgreementPublicKey', 'createdAt', 'expiresAt', 'signature']
@@ -106,5 +111,5 @@ export function row(p, meta) {
     return { destinationNodeId: meta.destination, packetKey: `${meta.priority}#${String(createdAt).padStart(13, '0')}#${meta.type}#${meta.id}`,
         packetType: meta.type, stableId: meta.id, sourceNodeId: meta.source, event: meta.event,
         payload: p, createdAt, expiresAt: p.expiresAt, ttl: Math.floor(p.expiresAt / 1000),
-        digest: digest(canonicalJson(p)) };
+        digest: digest(meta.type === 'MESSAGE' ? originBytes(p) : canonicalJson(p)) };
 }

@@ -3,7 +3,7 @@ package com.plexus.app
 import androidx.room.withTransaction
 
 
-class AntiPacketStore(private val database: PlexusDatabase) {
+class AntiPacketStore(private val database: PlexusDatabase, private val localNodeId: String) {
     private val antiPacketDao = database.antiPacketDao()
     private val relayPacketDao = database.relayPacketDao()
 
@@ -62,7 +62,8 @@ class AntiPacketStore(private val database: PlexusDatabase) {
     ): StoreResult = database.withTransaction {
         antiPacketDao.deleteExpiredAntiPackets(now)
         val original = database.messageDao().getMessageById(packet.messageId)
-        if (original != null && original.isMine && original.contactNodeId != packet.recipientNodeId) {
+        if (original != null && original.isMine &&
+            (original.contactNodeId != packet.recipientNodeId || packet.sourceNodeId != localNodeId)) {
             return@withTransaction StoreResult.INVALID
         }
         if (!locallyCreated && original == null &&

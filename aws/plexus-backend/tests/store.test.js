@@ -30,6 +30,16 @@ test('message transaction atomically gates on absence of proof and immutable ide
     assert.match(vaccine.Update.ConditionExpression, /recipientNodeId = :dest/);
     assert.deepEqual(pending.Put.Item, item); assert.equal(item.ttl, Math.floor(p.expiresAt / 1000));
 });
+test('courier admission records bounded proof recipients in the same transaction', async () => {
+    const s = setup(), a = identity(), b = identity(), c = identity(), p = message(a, c, Date.now());
+    const item = row(p, { id: p.packetId, type: 'MESSAGE', source: a.nodeId, destination: c.nodeId, priority: 2, event: 'internet:packet' });
+    await s.store.queueMessage(item, b.nodeId);
+    const update = s.calls[0].input.TransactItems[0].Update;
+    assert.match(update.UpdateExpression, /ADD gatewayNodeIds :gateways/);
+    assert.match(update.ConditionExpression, /size\(gatewayNodeIds\) < :maxGateways/);
+    assert.deepEqual(update.ExpressionAttributeValues[':gateways'], new Set([b.nodeId]));
+    assert.equal(update.ExpressionAttributeValues[':maxGateways'], 16);
+});
 test('proof and sender notification are in one atomic write and preserve message reservation metadata', async () => {
     const s = setup(), a = identity(), b = identity(), v = proof(message(a, b, Date.now()), b, Date.now());
     const item = row(v, { id: v.messageId, type: 'DELIVERY_PROOF', source: b.nodeId, destination: a.nodeId, priority: 0, event: 'internet:anti_packet' });
@@ -39,6 +49,16 @@ test('proof and sender notification are in one atomic write and preserve message
     assert.match(operations[0].Update.ConditionExpression, /attribute_not_exists\(proof\)/);
     assert.doesNotMatch(operations[0].Update.UpdateExpression, /pendingKey/);
     assert.equal(operations[1].Put.Item.destinationNodeId, a.nodeId);
+});
+test('proof transaction atomically queues each gateway and checks the observed gateway set', async () => {
+    const s = setup(), a = identity(), b = identity(), c = identity(), p = message(a, c, Date.now());
+    const v = proof(p, c, Date.now());
+    const item = row(v, { id: v.messageId, type: 'DELIVERY_PROOF', source: c.nodeId, destination: a.nodeId, priority: 0, event: 'internet:anti_packet' });
+    await s.store.saveProof(item, { sourceNodeId: a.nodeId, recipientNodeId: c.nodeId, gatewayNodeIds: new Set([b.nodeId]) });
+    const operations = s.calls[0].input.TransactItems;
+    assert.match(operations[0].Update.ConditionExpression, /gatewayNodeIds = :oldGateways/);
+    assert.equal(operations.length, 3);
+    assert.deepEqual(new Set(operations.slice(1).map(x => x.Put.Item.destinationNodeId)), new Set([a.nodeId, b.nodeId]));
 });
 test('sync query is strongly consistent, bounded, ordered and excludes metadata markers', async () => {
     const s = setup(); await s.store.page('node', undefined);

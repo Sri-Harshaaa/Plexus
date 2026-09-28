@@ -1,10 +1,25 @@
 package com.plexus.app
 
 import androidx.room.withTransaction
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 
-class MeshRelayStore(private val database: PlexusDatabase) {
+class MeshRelayStore(private val database: PlexusDatabase, private val identity: PlexusIdentity) {
     private val relayPacketDao = database.relayPacketDao()
+    private suspend fun cleanup(now: Long) = relayPacketDao.deleteUnusablePackets(now, identity.nodeId)
+
+    private suspend fun packetForRetry(entity: RelayPacketEntity): NearbyMeshPacket? {
+        val packet = entity.toMeshPacket()
+        if (packet.originSignature.isNotEmpty()) return packet
+        // Existing local Room packets predate origin signatures. Only their owner can upgrade them.
+        if (packet.sourceNodeId != identity.nodeId) return null // Unsigned foreign rows are purged by cleanup().
+        val signed = withContext(Dispatchers.IO) { packet.signAs(identity) }
+        val updated = relayPacketDao.signLegacyLocal(packet.packetId, identity.nodeId,
+            signed.originSigningPublicKey, signed.originSignature)
+        return resolvedLegacyPacket(signed, updated,
+            if (updated == 0) relayPacketDao.getPacket(packet.packetId) else null)
+    }
 
 
     /*
@@ -49,7 +64,7 @@ class MeshRelayStore(private val database: PlexusDatabase) {
         locallyCreated: Boolean = false
     ): StoreResult =
         database.withTransaction {
-            relayPacketDao.deleteExpiredPackets(now)
+            cleanup(now)
             if (!locallyCreated && !relayPacketDao.containsPacket(packet.packetId) &&
                 relayPacketDao.countActivePackets(now) >= 2048) return@withTransaction StoreResult.INVALID
             val vaccine = database.antiPacketDao().getAntiPacket(packet.packetId)
@@ -79,7 +94,7 @@ class MeshRelayStore(private val database: PlexusDatabase) {
             packet.hopCount !in 0..MeshPolicy.MAX_MESH_HOPS ||
             packet.expiresAt - packet.createdAt > PacketReplayGuard.MESSAGE_TTL_MS ||
             packet.createdAt > now + PacketReplayGuard.MAX_FUTURE_CLOCK_SKEW_MS ||
-            packet.encryptedPayload.isBlank()
+            packet.encryptedPayload.isBlank() || !packet.hasValidOrigin()
         ) {
 
             return StoreResult.INVALID
@@ -107,10 +122,7 @@ class MeshRelayStore(private val database: PlexusDatabase) {
          * Remove dead packets while we are already touching
          * the relay database.
          */
-        relayPacketDao
-            .deleteExpiredPackets(
-                now
-            )
+        cleanup(now)
 
 
 
@@ -201,10 +213,7 @@ class MeshRelayStore(private val database: PlexusDatabase) {
 
 
 
-        relayPacketDao
-            .deleteExpiredPackets(
-                now
-            )
+        cleanup(now)
 
 
 
@@ -252,7 +261,7 @@ class MeshRelayStore(private val database: PlexusDatabase) {
 
 
             .mapNotNull { entity ->
-                val packet = entity.toMeshPacket()
+                val packet = packetForRetry(entity) ?: return@mapNotNull null
                 // Retransmission by the original sender is still hop zero.
                 if (packet.sourceNodeId == localNodeId) packet else packet.forwardedCopy(now)
             }
@@ -260,28 +269,12 @@ class MeshRelayStore(private val database: PlexusDatabase) {
 
 
 
-    /*
-     * =========================================================
-     * GET PACKETS CREATED BY THIS NODE FOR INTERNET RETRY
-     * =========================================================
-     *
-     * These are packets whose original sourceNodeId is this
-     * device.
-     *
-     * This is intentionally different from mesh forwarding:
-     *
-     * - we do NOT upload arbitrary relay traffic to the server
-     * - the current backend only accepts packets whose
-     *   sourceNodeId matches the authenticated socket identity
-     * - we do NOT increment hopCount when retrying the original
-     *   sender's packet through the internet path
-     *
-     * The returned packets stay in Room until a valid signed
-     * delivery anti-packet removes them or their TTL expires.
-     */
+    // Every authenticated Internet-capable node may upload its durable signed relay copies.
 
     suspend fun getInternetUploadCandidates(
         localNodeId: String,
+        offset: Int = 0,
+        limit: Int = 32,
         now: Long =
             System.currentTimeMillis()
     ): List<NearbyMeshPacket> {
@@ -296,32 +289,12 @@ class MeshRelayStore(private val database: PlexusDatabase) {
 
 
 
-        relayPacketDao
-            .deleteExpiredPackets(
-                now
-            )
+        cleanup(now)
 
 
 
-        return relayPacketDao
-            .getActivePackets(
-                now
-            )
-            .asSequence()
-            .filter { entity ->
-
-                entity.sourceNodeId ==
-                        localNodeId
-            }
-            .sortedBy { entity ->
-
-                entity.storedAt
-            }
-            .mapNotNull { entity ->
-
-                entity.toMeshPacket()
-            }
-            .toList()
+        return relayPacketDao.getInternetUploadPage(localNodeId, now, limit, offset)
+            .mapNotNull { packetForRetry(it) }
     }
 
 
@@ -351,10 +324,7 @@ class MeshRelayStore(private val database: PlexusDatabase) {
 
 
 
-        relayPacketDao
-            .deleteExpiredPackets(
-                now
-            )
+        cleanup(now)
 
 
 
@@ -368,13 +338,7 @@ class MeshRelayStore(private val database: PlexusDatabase) {
                     now
             )
             .mapNotNull { entity ->
-
-
-                entity
-                    .toMeshPacket()
-                    .forwardedCopy(
-                        now
-                    )
+                packetForRetry(entity)?.forwardedCopy(now)
             }
     }
 
@@ -428,10 +392,7 @@ class MeshRelayStore(private val database: PlexusDatabase) {
     ): Int {
 
 
-        return relayPacketDao
-            .deleteExpiredPackets(
-                now
-            )
+        return cleanup(now)
     }
 
 
@@ -448,10 +409,7 @@ class MeshRelayStore(private val database: PlexusDatabase) {
     ): Int {
 
 
-        relayPacketDao
-            .deleteExpiredPackets(
-                now
-            )
+        cleanup(now)
 
 
         return relayPacketDao
@@ -460,3 +418,9 @@ class MeshRelayStore(private val database: PlexusDatabase) {
             )
     }
 }
+
+internal fun resolvedLegacyPacket(signed: NearbyMeshPacket, updated: Int,
+                                  persisted: RelayPacketEntity?): NearbyMeshPacket? =
+    if (updated == 1) signed else persisted?.toMeshPacket()?.takeIf {
+        it.originSignature.isNotEmpty() && it.originBytes().contentEquals(signed.originBytes())
+    }

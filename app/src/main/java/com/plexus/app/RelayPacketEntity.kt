@@ -1,6 +1,7 @@
 package com.plexus.app
 
 import androidx.room.Entity
+import androidx.room.ColumnInfo
 import androidx.room.PrimaryKey
 
 
@@ -69,6 +70,8 @@ data class RelayPacketEntity(
      * the AES key required to decrypt the message body.
      */
     val encryptedPayload: String,
+    @ColumnInfo(defaultValue = "''") val originSigningPublicKey: String,
+    @ColumnInfo(defaultValue = "''") val originSignature: String,
 
 
     /*
@@ -110,8 +113,9 @@ data class RelayPacketEntity(
             hopCount =
                 hopCount,
 
-            encryptedPayload =
-                encryptedPayload
+            encryptedPayload = encryptedPayload,
+            originSigningPublicKey = originSigningPublicKey,
+            originSignature = originSignature
         )
     }
 
@@ -151,8 +155,9 @@ data class RelayPacketEntity(
                 hopCount =
                     packet.hopCount,
 
-                encryptedPayload =
-                    packet.encryptedPayload,
+                encryptedPayload = packet.encryptedPayload,
+                originSigningPublicKey = packet.originSigningPublicKey,
+                originSignature = packet.originSignature,
 
                 storedAt =
                     System.currentTimeMillis()

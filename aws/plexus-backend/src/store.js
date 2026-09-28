@@ -1,7 +1,15 @@
 import { GetCommand, PutCommand, UpdateCommand, DeleteCommand, QueryCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
 
 export const conditional = e => e?.name === 'ConditionalCheckFailedException' ||
-    (e?.name === 'TransactionCanceledException' && e.CancellationReasons?.some(r => r.Code === 'ConditionalCheckFailed'));
+    (e?.name === 'TransactionCanceledException' && e.CancellationReasons?.some(r => r.Code === 'ConditionalCheckFailed') &&
+        e.CancellationReasons.every(r => ['None', 'ConditionalCheckFailed'].includes(r?.Code)));
+
+// Missing reasons also occur in real SDK exceptions. Only the caller's strong
+// post-transaction reads can establish whether an expected race actually won.
+export const transactionRaceCandidate = e => conditional(e) ||
+    (e?.name === 'TransactionCanceledException' &&
+        (!e.CancellationReasons?.length || e.CancellationReasons.every(r =>
+            !r?.Code || ['None', 'ConditionalCheckFailed', 'TransactionConflict'].includes(r.Code))));
 
 /** No invocation-local state owns identity, pending work, locks, or delivery decisions. */
 export class DynamoStore {
@@ -55,15 +63,17 @@ export class DynamoStore {
             cursor = page.LastEvaluatedKey;
         } while (cursor);
     }
-    async queueMessage(item) {
+    async queueMessage(item, uploader) {
         const p = item.payload;
+        const gateway = uploader && uploader !== p.sourceNodeId;
         await this.db.send(new TransactWriteCommand({ TransactItems: [
             { Update: { TableName: this.tables.vaccines, Key: { messageId: p.packetId },
-                UpdateExpression: 'SET sourceNodeId = if_not_exists(sourceNodeId, :source), recipientNodeId = if_not_exists(recipientNodeId, :dest), packetDigest = if_not_exists(packetDigest, :digest), pendingKey = if_not_exists(pendingKey, :key), createdAt = if_not_exists(createdAt, :created), expiresAt = if_not_exists(expiresAt, :expiry), #ttl = if_not_exists(#ttl, :ttl)',
-                ConditionExpression: 'attribute_not_exists(proof) AND (attribute_not_exists(sourceNodeId) OR (sourceNodeId = :source AND recipientNodeId = :dest)) AND (attribute_not_exists(packetDigest) OR packetDigest = :digest)',
+                UpdateExpression: 'SET sourceNodeId = if_not_exists(sourceNodeId, :source), recipientNodeId = if_not_exists(recipientNodeId, :dest), packetDigest = if_not_exists(packetDigest, :digest), pendingKey = if_not_exists(pendingKey, :key), createdAt = if_not_exists(createdAt, :created), expiresAt = if_not_exists(expiresAt, :expiry), #ttl = if_not_exists(#ttl, :ttl)' + (gateway ? ' ADD gatewayNodeIds :gateways' : ''),
+                ConditionExpression: 'attribute_not_exists(proof) AND (attribute_not_exists(sourceNodeId) OR (sourceNodeId = :source AND recipientNodeId = :dest)) AND (attribute_not_exists(packetDigest) OR packetDigest = :digest)' +
+                    (gateway ? ' AND (attribute_not_exists(gatewayNodeIds) OR size(gatewayNodeIds) < :maxGateways OR contains(gatewayNodeIds, :uploader))' : ''),
                 ExpressionAttributeNames: { '#ttl': 'ttl' }, ExpressionAttributeValues: { ':source': item.sourceNodeId,
                     ':dest': item.destinationNodeId, ':digest': item.digest, ':key': item.packetKey, ':created': item.createdAt,
-                    ':expiry': item.expiresAt, ':ttl': item.ttl } } },
+                    ':expiry': item.expiresAt, ':ttl': item.ttl, ...(gateway ? { ':gateways': new Set([uploader]), ':maxGateways': 16, ':uploader': uploader } : {}) } } },
             { Put: { TableName: this.tables.pending, Item: item,
                 ConditionExpression: 'attribute_not_exists(packetKey) OR digest = :digest', ExpressionAttributeValues: { ':digest': item.digest } } }
         ] }));
@@ -75,13 +85,24 @@ export class DynamoStore {
             ':digest': item.digest, ':expiry': expiry, ':ttl': Math.floor(expiry / 1000) };
         const expected = existing?.proof ? 'proofDigest = :old' : 'attribute_not_exists(proof)';
         if (existing?.proof) values[':old'] = existing.proofDigest;
+        const gateways = [...(existing?.gatewayNodeIds ?? [])].filter(node => node !== p.sourceNodeId);
+        const gatewayCondition = existing?.gatewayNodeIds ? 'gatewayNodeIds = :oldGateways' : 'attribute_not_exists(gatewayNodeIds)';
+        if (existing?.gatewayNodeIds) values[':oldGateways'] = existing.gatewayNodeIds;
         await this.db.send(new TransactWriteCommand({ TransactItems: [
             { Update: { TableName: this.tables.vaccines, Key: { messageId: p.messageId },
                 UpdateExpression: 'SET sourceNodeId = if_not_exists(sourceNodeId, :source), recipientNodeId = if_not_exists(recipientNodeId, :dest), proof = :proof, proofDigest = :digest, expiresAt = :expiry, #ttl = :ttl',
-                ConditionExpression: `(attribute_not_exists(sourceNodeId) OR (sourceNodeId = :source AND recipientNodeId = :dest)) AND (${expected})`,
+                ConditionExpression: `(attribute_not_exists(sourceNodeId) OR (sourceNodeId = :source AND recipientNodeId = :dest)) AND (${expected}) AND ${gatewayCondition}`,
                 ExpressionAttributeNames: { '#ttl': 'ttl' }, ExpressionAttributeValues: values } },
-            { Put: { TableName: this.tables.pending, Item: item } }
+            { Put: { TableName: this.tables.pending, Item: item } },
+            ...gateways.map(node => ({ Put: { TableName: this.tables.pending,
+                Item: { ...item, destinationNodeId: node } } }))
         ] }));
+    }
+    async queueGatewayProof(item, gateway) {
+        await this.db.send(new PutCommand({ TableName: this.tables.pending,
+            Item: { ...item, destinationNodeId: gateway },
+            ConditionExpression: 'attribute_not_exists(packetKey) OR digest = :digest',
+            ExpressionAttributeValues: { ':digest': item.digest } }));
     }
     async deletePending(node, key) {
         await this.db.send(new DeleteCommand({ TableName: this.tables.pending, Key: { destinationNodeId: node, packetKey: key } }));

@@ -1,7 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setup, identity, message, proof, request, response, signed } from './fixtures.js';
-import { authBytes, proofBytes, controlBytes, DAY } from '../src/protocol.js';
+import { authBytes, proofBytes, controlBytes, originBytes, DAY } from '../src/protocol.js';
+import { TransactionCanceledException } from '@aws-sdk/client-dynamodb';
+
+const canceled = reasons => new TransactionCanceledException({ $metadata: { httpStatusCode: 400 },
+    message: 'Transaction cancelled', ...(reasons ? { CancellationReasons: reasons } : {}) });
 
 test('$connect is unauthenticated, idempotent, and TTL is seconds', async () => {
     const s = setup(); await s.call('a', '$connect'); await s.call('a', '$connect');
@@ -50,10 +54,10 @@ test('offline message is durably queued before accepted acknowledgement', async 
     assert.deepEqual(s.store.trace, ['persist', 'post']); assert.equal(s.store.packets.size, 1);
     assert.equal(s.events.at(-1).event, 'internet:ack');
 });
-test('authenticated source cannot impersonate another sender', async () => {
+test('uploader cannot impersonate an origin with the wrong public key', async () => {
     const s = setup(), a = identity(), b = identity(); await s.auth('a', a);
-    await s.call('a', 'sendPacket', { packet: message(b, a, s.now()) });
-    assert.equal(s.error(), 'SOURCE_IDENTITY_MISMATCH'); assert.equal(s.store.packets.size, 0);
+    await s.call('a', 'sendPacket', { packet: { ...message(b, a, s.now()), originSigningPublicKey: a.signingPublicKey } });
+    assert.equal(s.error(), 'IDENTITY_MISMATCH'); assert.equal(s.store.packets.size, 0);
 });
 test('persistence precedes live send and network success retains ciphertext', async () => {
     const s = setup(), a = identity(), b = identity(); await s.auth('a', a); await s.auth('b', b);
@@ -71,7 +75,271 @@ test('duplicate message is idempotent and conflicting ID cannot replace it', asy
     const s = setup(), a = identity(), b = identity(); await s.auth('a', a); const p = message(a, b, s.now());
     await s.call('a', 'sendPacket', { packet: p }); await s.call('a', 'sendPacket', { packet: p });
     assert.equal(s.store.packets.size, 1);
-    await s.call('a', 'sendPacket', { packet: { ...p, expiresAt: p.expiresAt - 1 } }); assert.equal(s.error(), 'MESSAGE_ID_CONFLICT');
+    await s.call('a', 'sendPacket', { packet: { ...p, expiresAt: p.expiresAt - 1 } }); assert.equal(s.error(), 'INVALID_SIGNATURE');
+});
+test('authenticated courier uploads signed origin packet without changing the source', async () => {
+    const s = setup(), a = identity(), b = identity(), c = identity(); await s.auth('b', b);
+    const p = message(a, c, s.now()); await s.call('b', 'sendPacket', { packet: p });
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+    assert.equal([...s.store.packets.values()][0].sourceNodeId, a.nodeId);
+    assert.deepEqual([...s.store.vaccines.get(p.packetId).gatewayNodeIds], [b.nodeId]);
+});
+test('origin canonical bytes match Android including explicit UTF-8 lengths', () => {
+    const sample = { packetId: 'id', sourceNodeId: 'a', destinationNodeId: 'b', createdAt: 1,
+        expiresAt: 10000, encryptedPayload: 'YWJj', hopCount: 7 };
+    assert.equal(originBytes(sample).toString(), 'PLEXUS_MESH_ORIGIN_V1|2:id|1:a|1:b|1:1|5:10000|4:YWJj|');
+});
+test('origin proof rejects forgery and every immutable-field alteration, but permits hops', async () => {
+    const s = setup(), a = identity(), b = identity(), c = identity(); await s.auth('b', b);
+    const p = message(a, c, s.now());
+    for (const changed of [
+        { ...p, originSignature: 'AAAA' },
+        { ...p, originSigningPublicKey: b.signingPublicKey },
+        { ...p, destinationNodeId: b.nodeId },
+        { ...p, encryptedPayload: p.encryptedPayload.slice(0, -4) + 'AAAA' },
+        { ...p, createdAt: p.createdAt + 1 },
+        { ...p, expiresAt: p.expiresAt - 1 }
+    ]) {
+        await s.call('b', 'sendPacket', { packet: changed });
+        assert.ok(['INVALID_SIGNATURE', 'IDENTITY_MISMATCH', 'INVALID_ENCRYPTED_PAYLOAD', 'INVALID_TIMESTAMPS'].includes(s.error()));
+    }
+    assert.equal(s.store.packets.size, 0);
+    await s.call('b', 'sendPacket', { packet: { ...p, hopCount: 5 } });
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+});
+test('multiple gateways converge on one durable packet despite different hop counts', async () => {
+    const s = setup(), a = identity(), b = identity(), d = identity(), c = identity();
+    await s.auth('b', b); await s.auth('d', d);
+    const p = message(a, c, s.now());
+    await s.call('b', 'sendPacket', { packet: { ...p, hopCount: 1 } });
+    await s.call('d', 'sendPacket', { packet: { ...p, hopCount: 2 } });
+    await s.call('b', 'sendPacket', { packet: p });
+    assert.equal(s.store.packets.size, 1);
+    assert.deepEqual(new Set(s.store.vaccines.get(p.packetId).gatewayNodeIds), new Set([b.nodeId, d.nodeId]));
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+});
+test('two valid signatures for identical origin bytes converge without a message conflict', async () => {
+    const s = setup(), a = identity(), b = identity(), c = identity();
+    await s.auth('a', a); await s.auth('b', b);
+    const p = message(a, c, s.now());
+    let alternate = signed(originBytes(p), a);
+    while (alternate === p.originSignature) alternate = signed(originBytes(p), a);
+    await s.call('a', 'sendPacket', { packet: p });
+    await s.call('b', 'sendPacket', { packet: { ...p, originSignature: alternate, hopCount: 2 } });
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+    assert.equal(s.store.packets.size, 1);
+    assert.deepEqual([...s.store.vaccines.get(p.packetId).gatewayNodeIds], [b.nodeId]);
+});
+test('gateway 17+ converges without growing the bounded proof-recipient set', async () => {
+    const s = setup(), a = identity(), c = identity(), p = message(a, c, s.now());
+    const gateways = Array.from({ length: 18 }, () => identity());
+    for (let i = 0; i < gateways.length; i++) {
+        await s.auth(`gateway-${i}`, gateways[i]);
+        await s.call(`gateway-${i}`, 'sendPacket', { packet: p });
+        assert.equal(s.events.at(-1).event, 'internet:ack');
+    }
+    assert.equal(s.store.vaccines.get(p.packetId).gatewayNodeIds.size, 16);
+    assert.equal(s.store.packets.size, 1);
+    // The two excess gateways are accepted, but are not promised proactive proof fanout.
+    assert.equal(s.store.vaccines.get(p.packetId).gatewayNodeIds.has(gateways[17].nodeId), false);
+});
+test('SDK cancellation with conditional reasons resolves a full gateway set from durable state', async () => {
+    const s = setup(), a = identity(), c = identity(), p = message(a, c, s.now());
+    const gateways = Array.from({ length: 17 }, () => identity());
+    for (let i = 0; i < 16; i++) {
+        await s.auth(`g${i}`, gateways[i]); await s.call(`g${i}`, 'sendPacket', { packet: p });
+    }
+    await s.auth('g16', gateways[16]);
+    s.store.beforeQueue = () => { throw canceled([{ Code: 'ConditionalCheckFailed' }, { Code: 'None' }]); };
+    s.events.length = 0;
+    await s.call('g16', 'sendPacket', { packet: p });
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+    assert.equal(s.store.vaccines.get(p.packetId).gatewayNodeIds.size, 16);
+    assert.equal(s.store.vaccines.get(p.packetId).gatewayNodeIds.has(gateways[16].nodeId), false);
+});
+test('SDK cancellation without reasons accepts gateway 17 but preserves the fanout cap and later proof', async () => {
+    const s = setup(), a = identity(), c = identity(), p = message(a, c, s.now());
+    const gateways = Array.from({ length: 17 }, () => identity());
+    await s.auth('c', c);
+    for (let i = 0; i < 16; i++) {
+        await s.auth(`g${i}`, gateways[i]); await s.call(`g${i}`, 'sendPacket', { packet: p });
+    }
+    await s.auth('g16', gateways[16]);
+    s.store.beforeQueue = () => { throw canceled(); };
+    s.events.length = 0;
+    await s.call('g16', 'sendPacket', { packet: p });
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+    assert.equal(s.store.vaccines.get(p.packetId).gatewayNodeIds.size, 16);
+    assert.equal(s.store.vaccines.get(p.packetId).gatewayNodeIds.has(gateways[16].nodeId), false);
+    s.store.beforeQueue = undefined;
+    await s.call('c', 'deliveryProof', { packet: proof(p, c, s.now()) });
+    s.events.length = 0;
+    await s.call('g16', 'sendPacket', { packet: p });
+    assert.deepEqual(s.events.filter(e => e.id === 'g16').map(e => e.event), ['internet:anti_packet', 'internet:ack']);
+});
+test('SDK cancellation without reasons retries a concurrent gateway update', async () => {
+    const s = setup(), a = identity(), b = identity(), d = identity(), c = identity();
+    await s.auth('b', b); await s.auth('d', d);
+    const p = message(a, c, s.now()); await s.call('b', 'sendPacket', { packet: p });
+    let attempts = 0;
+    s.store.beforeQueue = () => {
+        attempts++;
+        s.store.beforeQueue = undefined;
+        s.store.vaccines.get(p.packetId).gatewayNodeIds.add(identity().nodeId);
+        throw canceled();
+    };
+    s.events.length = 0;
+    await s.call('d', 'sendPacket', { packet: p });
+    assert.equal(attempts, 1);
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+    assert.equal(s.store.vaccines.get(p.packetId).gatewayNodeIds.has(d.nodeId), true);
+});
+test('SDK cancellation without reasons resolves an already-durable identical packet', async () => {
+    const s = setup(), a = identity(), c = identity(); await s.auth('a', a);
+    const p = message(a, c, s.now());
+    s.store.afterQueue = () => { throw canceled(); };
+    await s.call('a', 'sendPacket', { packet: p });
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+    assert.equal(s.store.packets.size, 1);
+    assert.equal(s.store.vaccines.get(p.packetId).packetDigest.length, 64);
+});
+test('ambiguous SDK cancellation rejects inconsistent message state', async () => {
+    const s = setup(), a = identity(), b = identity(), c = identity(); await s.auth('b', b);
+    const p = message(a, c, s.now()); await s.call('b', 'sendPacket', { packet: p });
+    s.store.beforeQueue = () => {
+        s.store.vaccines.get(p.packetId).packetDigest = 'different';
+        throw canceled();
+    };
+    s.events.length = 0;
+    await s.call('b', 'sendPacket', { packet: p });
+    assert.equal(s.error(), 'MESSAGE_ID_CONFLICT');
+    assert.equal(s.events.some(e => e.event === 'internet:ack'), false);
+});
+test('unrelated SDK cancellation and service errors retain retry failure behavior', async () => {
+    const s = setup(), a = identity(), c = identity(); await s.auth('a', a);
+    const p = message(a, c, s.now());
+    for (const error of [canceled(), canceled([{ Code: 'ValidationError', Message: 'bad expression' }]),
+        Object.assign(new Error('service unavailable'), { name: 'InternalServerError' })]) {
+        s.store.beforeQueue = () => { throw error; };
+        s.events.length = 0;
+        await s.call('a', 'sendPacket', { packet: p });
+        assert.equal(s.error(), 'RETRY_REQUIRED');
+        assert.equal(s.events.some(e => e.event === 'internet:ack'), false);
+        assert.equal(s.store.packets.size, 0);
+    }
+});
+test('non-conditional SDK cancellation is not hidden by an existing identical packet', async () => {
+    const s = setup(), a = identity(), c = identity(); await s.auth('a', a);
+    const p = message(a, c, s.now()); await s.call('a', 'sendPacket', { packet: p });
+    s.store.beforeQueue = () => { throw canceled([{ Code: 'ConditionalCheckFailed' }, { Code: 'ValidationError' }]); };
+    s.events.length = 0;
+    await s.call('a', 'sendPacket', { packet: p });
+    assert.equal(s.error(), 'RETRY_REQUIRED');
+    assert.equal(s.events.some(e => e.event === 'internet:ack'), false);
+    assert.equal(s.store.packets.size, 1);
+});
+test('ambiguous control transaction uses its existing durable marker', async () => {
+    const s = setup(), a = identity(), b = identity(); await s.auth('a', a);
+    const p = request(a, b, s.now()); await s.call('a', 'sendPacket', { packet: p });
+    const pending = s.store.pending.bind(s.store);
+    s.store.pending = async (...args) => { s.store.pending = pending; return undefined; };
+    s.store.beforeSaveControl = () => { throw canceled(); };
+    s.events.length = 0;
+    await s.call('a', 'sendPacket', { packet: p });
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+    assert.equal(s.store.packets.size, 2);
+});
+test('proof racing the over-cap duplicate still returns the vaccine to that gateway', async () => {
+    const s = setup(), a = identity(), c = identity(), p = message(a, c, s.now());
+    const gateways = Array.from({ length: 17 }, () => identity());
+    await s.auth('c', c);
+    for (let i = 0; i < 16; i++) {
+        await s.auth(`gateway-${i}`, gateways[i]);
+        await s.call(`gateway-${i}`, 'sendPacket', { packet: p });
+    }
+    await s.auth('gateway-16', gateways[16]);
+    const pending = s.store.pending.bind(s.store);
+    s.store.pending = async (...args) => {
+        s.store.pending = pending;
+        await s.call('c', 'deliveryProof', { packet: proof(p, c, s.now()) });
+        return pending(...args);
+    };
+    await s.call('gateway-16', 'sendPacket', { packet: p });
+    assert.ok(s.events.some(e => e.id === 'gateway-16' && e.event === 'internet:anti_packet'));
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+});
+test('recipient proof reaches gateways and remains durable for offline origin', async () => {
+    const s = setup(), a = identity(), b = identity(), c = identity(); await s.auth('b', b); await s.auth('c', c);
+    const p = message(a, c, s.now()), v = proof(p, c, s.now());
+    await s.call('b', 'sendPacket', { packet: p });
+    await s.call('c', 'deliveryProof', { packet: v });
+    assert.ok(s.store.vaccines.get(p.packetId).proof);
+    assert.equal([...s.store.packets.values()].filter(x => x.packetType === 'MESSAGE').length, 0);
+    assert.deepEqual(new Set([...s.store.packets.values()].map(x => x.destinationNodeId)), new Set([a.nodeId, b.nodeId]));
+    assert.ok(s.events.some(e => e.id === 'b' && e.event === 'internet:anti_packet' && e.data.messageId === p.packetId));
+    s.events.length = 0; await s.call('b', 'sync');
+    assert.ok(s.events.some(e => e.id === 'b' && e.event === 'internet:anti_packet'));
+});
+test('duplicate recipient proof does not rebroadcast to prior gateways; late uploader still gets vaccine', async () => {
+    const s = setup(), a = identity(), b = identity(), c = identity(), d = identity();
+    await s.auth('b', b); await s.auth('c', c); await s.auth('d', d);
+    const p = message(a, c, s.now()), v = proof(p, c, s.now());
+    await s.call('b', 'sendPacket', { packet: p });
+    await s.call('c', 'deliveryProof', { packet: v });
+    s.events.length = 0;
+    s.store.beforeSaveProof = () => { throw new Error('duplicate proof must not rewrite fanout'); };
+    await s.call('c', 'deliveryProof', { packet: v });
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+    assert.equal(s.events.filter(e => e.event === 'internet:anti_packet').length, 0);
+    await s.call('d', 'sendPacket', { packet: p });
+    assert.ok(s.events.some(e => e.id === 'd' && e.event === 'internet:anti_packet'));
+    assert.ok([...s.store.packets.values()].some(x => x.packetType === 'DELIVERY_PROOF' && x.destinationNodeId === d.nodeId));
+});
+test('proof retries when a concurrent gateway joins after the vaccine read', async () => {
+    const s = setup(), a = identity(), b = identity(), d = identity(), c = identity();
+    await s.auth('b', b); await s.auth('c', c);
+    const p = message(a, c, s.now()); await s.call('b', 'sendPacket', { packet: p });
+    s.store.beforeSaveProof = () => {
+        s.store.beforeSaveProof = undefined;
+        s.store.vaccines.get(p.packetId).gatewayNodeIds.add(d.nodeId);
+    };
+    await s.call('c', 'deliveryProof', { packet: proof(p, c, s.now()) });
+    assert.deepEqual(new Set([...s.store.packets.values()].filter(x => x.packetType === 'DELIVERY_PROOF').map(x => x.destinationNodeId)),
+        new Set([a.nodeId, b.nodeId, d.nodeId]));
+});
+test('SDK cancellation without reasons retries proof against a concurrent gateway update', async () => {
+    const s = setup(), a = identity(), b = identity(), d = identity(), c = identity();
+    await s.auth('b', b); await s.auth('c', c);
+    const p = message(a, c, s.now()); await s.call('b', 'sendPacket', { packet: p });
+    s.store.beforeSaveProof = () => {
+        s.store.beforeSaveProof = undefined;
+        s.store.vaccines.get(p.packetId).gatewayNodeIds.add(d.nodeId);
+        throw canceled();
+    };
+    s.events.length = 0;
+    await s.call('c', 'deliveryProof', { packet: proof(p, c, s.now()) });
+    assert.ok(s.events.some(e => e.id === 'c' && e.event === 'internet:ack'));
+    assert.deepEqual(new Set([...s.store.packets.values()].filter(x => x.packetType === 'DELIVERY_PROOF').map(x => x.destinationNodeId)),
+        new Set([a.nodeId, b.nodeId, d.nodeId]));
+});
+test('SDK cancellation without reasons accepts a concurrently stored proof', async () => {
+    const s = setup(), a = identity(), b = identity(), c = identity();
+    await s.auth('b', b); await s.auth('c', c);
+    const p = message(a, c, s.now()), v = proof(p, c, s.now());
+    await s.call('b', 'sendPacket', { packet: p });
+    s.store.afterSaveProof = () => { throw canceled(); };
+    s.events.length = 0;
+    await s.call('c', 'deliveryProof', { packet: v });
+    assert.equal(s.events.at(-1).event, 'internet:ack');
+    assert.equal(s.store.vaccines.get(p.packetId).proof.signature, v.signature);
+});
+test('gateway arriving after a Nearby proof gets a durable proof, not resurrected ciphertext', async () => {
+    const s = setup(), a = identity(), b = identity(), c = identity(); await s.auth('b', b); await s.auth('c', c);
+    const p = message(a, c, s.now()); await s.call('c', 'deliveryProof', { packet: proof(p, c, s.now()) });
+    await s.call('b', 'sendPacket', { packet: p });
+    assert.equal([...s.store.packets.values()].filter(x => x.packetType === 'MESSAGE').length, 0);
+    assert.ok([...s.store.packets.values()].some(x => x.packetType === 'DELIVERY_PROOF' && x.destinationNodeId === b.nodeId));
+    assert.ok(s.events.some(e => e.id === 'b' && e.event === 'internet:anti_packet'));
 });
 test('multiple authenticated connections for the same node receive live traffic', async () => {
     const s = setup(), a = identity(), b = identity(); await s.auth('a', a); await s.auth('b1', b); await s.auth('b2', b);
