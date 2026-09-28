@@ -921,7 +921,7 @@ class MainActivity : ComponentActivity() {
                                     identity,
 
                                 serverUrl =
-                                    "https://plexus-server.onrender.com",
+                                    BuildConfig.PLEXUS_WEBSOCKET_URL,
 
                                 listener =
                                     object :
@@ -943,6 +943,12 @@ class MainActivity : ComponentActivity() {
                                                 "PlexusInternet",
                                                 "SERVER AUTH COMPLETE ✅ 🔐 🌐"
                                             )
+
+                                            onRetryPending()
+                                        }
+
+                                        override fun onRetryPending() {
+                                            if (internetSyncJob[0]?.isActive == true) return
 
 
                                             /*
@@ -974,7 +980,7 @@ class MainActivity : ComponentActivity() {
                                                  * only packets originally created by THIS node to
                                                  * the backend.
                                                  *
-                                                 * Never delete them merely because Socket.IO accepts
+                                                 * Never delete them merely because the relay accepts
                                                  * the upload. A valid signed delivery anti-packet
                                                  * remains the authority that kills the local copy.
                                                  */
@@ -1197,6 +1203,7 @@ class MainActivity : ComponentActivity() {
 
 
                                                         if (
+                                                            !requestPacket.verify() ||
                                                             requestPacket.recipientNodeId !=
                                                             identity.nodeId ||
                                                             requestPacket.senderNodeId !=
@@ -1297,7 +1304,8 @@ class MainActivity : ComponentActivity() {
                                                                 0
                                                             ]
                                                                 ?.sendAntiPacket(
-                                                                    antiPacket
+                                                                    antiPacket,
+                                                                    background = true
                                                                 )
                                                                 ?: false
 
@@ -1308,6 +1316,8 @@ class MainActivity : ComponentActivity() {
 
                                                             uploadedCount +=
                                                                 1
+                                                        } else {
+                                                            break
                                                         }
                                                     }
 
@@ -1340,7 +1350,7 @@ class MainActivity : ComponentActivity() {
 
 
                                         override fun onDisconnected() {
-                                        internetSyncJob[0]?.cancel()
+                                            internetSyncJob[0]?.cancel()
 
 
                                             Log.d(
@@ -3922,7 +3932,7 @@ class MainActivity : ComponentActivity() {
 
                                                                     AntiPacketStore.StoreResult.STORED,
                                                                     AntiPacketStore.StoreResult.DUPLICATE -> {
-                                                                packetReplayGuard.markAccepted(encryptedPacket.messageId)
+                                                                        packetReplayGuard.markAccepted(encryptedPacket.messageId)
 
 
 
@@ -4225,7 +4235,7 @@ class MainActivity : ComponentActivity() {
 
                         Log.d(
                             "PlexusInternet",
-                            "Starting internet transport -> https://plexus-server.onrender.com"
+                            "Starting Internet WebSocket transport"
                         )
 
                         internetManager.start()
@@ -4233,10 +4243,7 @@ class MainActivity : ComponentActivity() {
                             delay(30_000L)
                             if (!internetManager.isAuthenticated()) continue
                             try {
-                                for (packet in meshRelayStore.getInternetUploadCandidates(identity.nodeId)) {
-                                    if (!internetManager.sendMeshPacket(packet)) break
-                                    delay(75L)
-                                }
+                                internetManager.retryPending()
                             } catch (cancelled: kotlinx.coroutines.CancellationException) {
                                 throw cancelled
                             } catch (exception: Exception) {
@@ -4247,7 +4254,7 @@ class MainActivity : ComponentActivity() {
 
 
                     /*
-                 * Cleanly close Socket.IO listeners/socket when this
+                 * Cleanly close WebSocket listeners/socket when this
                  * Compose tree is disposed.
                  */
                     DisposableEffect(
@@ -4256,6 +4263,7 @@ class MainActivity : ComponentActivity() {
 
                         onDispose {
 
+                            internetSyncJob[0]?.cancel()
                             internetManager.stop()
                         }
                     }
@@ -5990,7 +5998,7 @@ class MainActivity : ComponentActivity() {
                                                      * Send the exact same encrypted mesh
                                                      * envelope to the authenticated backend.
                                                      *
-                                                     * Socket.IO emit is NOT treated as final
+                                                     * WebSocket enqueue is NOT treated as final
                                                      * delivery. The server keeps its copy until
                                                      * the recipient returns a signed anti-packet.
                                                      */
@@ -8140,6 +8148,23 @@ fun PlexusHomeScreen(
     val clearSearchFocus = {
 
         focusManager.clearFocus()
+    }
+
+
+    /*
+     * Home owns the search query, so it must also own Back while a search
+     * is active. Otherwise the Activity receives Back and exits Plexus.
+     * Clearing focus also dismisses the keyboard.
+     */
+    BackHandler(
+        enabled =
+            searchText.isNotEmpty()
+    ) {
+
+        searchText =
+            ""
+
+        clearSearchFocus()
     }
 
 

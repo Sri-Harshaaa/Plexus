@@ -1,0 +1,17 @@
+{
+  "name": "plexus-aws-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test --experimental-test-isolation=none tests/*.test.js",
+    "check": "node --check index.mjs && node --check src/handler.js && node --check src/store.js && node --check src/protocol.js && node --check src/websocket.js",
+    "package": "mkdir -p dist && zip -q -r dist/plexus-backend.zip index.mjs src node_modules package.json package-lock.json"
+  },
+  "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "3.922.0",
+    "@aws-sdk/client-dynamodb": "3.922.0",
+    "@aws-sdk/lib-dynamodb": "3.922.0"
+  }
+}

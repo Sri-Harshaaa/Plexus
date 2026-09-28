@@ -1,0 +1,62 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { DynamoStore } from '../src/store.js';
+import { row } from '../src/protocol.js';
+import { identity, message, proof } from './fixtures.js';
+const tables = { connections: 'connections', pending: 'pending', vaccines: 'vaccines', nodeIndex: 'nodeId-index' };
+function setup(replies = []) {
+    const calls = [];
+    const store = new DynamoStore({ async send(command) { calls.push(command); return replies.shift() ?? {}; } }, tables);
+    return { store, calls };
+}
+test('base-table reads are strong; GSI query paginates without ConsistentRead', async () => {
+    const s = setup([{ Item: { connectionId: 'c' } }, { Item: { messageId: 'm' } },
+        { Items: [{ connectionId: 'a' }], LastEvaluatedKey: { connectionId: 'a' } }, { Items: [{ connectionId: 'b' }] }]);
+    await s.store.connection('c'); await s.store.vaccine('m');
+    const ids = []; for await (const id of s.store.online('node')) ids.push(id);
+    assert.deepEqual(ids, ['a', 'b']); assert.equal(s.calls[0].input.ConsistentRead, true);
+    assert.equal(s.calls[1].input.ConsistentRead, true); assert.equal(s.calls[2].input.ConsistentRead, undefined);
+    assert.equal(s.calls[2].input.IndexName, 'nodeId-index');
+    assert.deepEqual(s.calls[3].input.ExclusiveStartKey, { connectionId: 'a' });
+});
+test('message transaction atomically gates on absence of proof and immutable identity/digest', async () => {
+    const s = setup(), a = identity(), b = identity(), p = message(a, b, Date.now());
+    const item = row(p, { id: p.packetId, type: 'MESSAGE', source: a.nodeId, destination: b.nodeId, priority: 2, event: 'internet:packet' });
+    await s.store.queueMessage(item);
+    const command = s.calls[0]; assert.equal(command.constructor.name, 'TransactWriteCommand');
+    const [vaccine, pending] = command.input.TransactItems;
+    assert.match(vaccine.Update.ConditionExpression, /attribute_not_exists\(proof\)/);
+    assert.match(vaccine.Update.ConditionExpression, /packetDigest = :digest/);
+    assert.match(vaccine.Update.ConditionExpression, /recipientNodeId = :dest/);
+    assert.deepEqual(pending.Put.Item, item); assert.equal(item.ttl, Math.floor(p.expiresAt / 1000));
+});
+test('proof and sender notification are in one atomic write and preserve message reservation metadata', async () => {
+    const s = setup(), a = identity(), b = identity(), v = proof(message(a, b, Date.now()), b, Date.now());
+    const item = row(v, { id: v.messageId, type: 'DELIVERY_PROOF', source: b.nodeId, destination: a.nodeId, priority: 0, event: 'internet:anti_packet' });
+    await s.store.saveProof(item, undefined);
+    const operations = s.calls[0].input.TransactItems;
+    assert.equal(operations.length, 2); assert.equal(operations[0].Update.TableName, 'vaccines');
+    assert.match(operations[0].Update.ConditionExpression, /attribute_not_exists\(proof\)/);
+    assert.doesNotMatch(operations[0].Update.UpdateExpression, /pendingKey/);
+    assert.equal(operations[1].Put.Item.destinationNodeId, a.nodeId);
+});
+test('sync query is strongly consistent, bounded, ordered and excludes metadata markers', async () => {
+    const s = setup(); await s.store.page('node', undefined);
+    const input = s.calls[0].input;
+    assert.equal(input.ConsistentRead, true); assert.equal(input.Limit, 20);
+    assert.equal(input.ExpressionAttributeValues[':upper'], '3');
+    assert.equal(input.ScanIndexForward, undefined); assert.equal(input.IndexName, undefined);
+});
+test('auth success condition consumes the exact unexpired challenge and removes it', async () => {
+    const s = setup(); await s.store.authenticate('c', { connectedAt: 1000, claimedNodeId: 'node', challengeId: 'challenge' }, 2000);
+    const input = s.calls[0].input;
+    assert.match(input.ConditionExpression, /challengeId = :challengeId AND challengeExpiresAt > :now/);
+    assert.match(input.UpdateExpression, /REMOVE challengeId, challenge, challengeExpiresAt, claimedNodeId/);
+    assert.equal(input.ExpressionAttributeValues[':node'], 'node');
+});
+test('conditional lease and rate limits live in DynamoDB, not local maps', async () => {
+    const s = setup(); await s.store.rate('c', 1000); await s.store.lockSync('c', 'token', 1000); await s.store.unlockSync('c', 'token');
+    assert.match(s.calls[0].input.ConditionExpression, /rateWindow/);
+    assert.match(s.calls[1].input.ConditionExpression, /syncUntil < :now/);
+    assert.equal(s.calls[2].input.ConditionExpression, 'syncToken = :token');
+});

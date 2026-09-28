@@ -7,9 +7,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
-import androidx.compose.foundation.gestures.Orientation
-import androidx.compose.foundation.gestures.draggable
-import androidx.compose.foundation.gestures.rememberDraggableState
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -60,7 +59,12 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.TextFieldValue
@@ -69,6 +73,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.delay
+import kotlin.math.abs
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -169,6 +174,35 @@ fun PlexusChatScreen(
         mutableStateOf<String?>(
             null
         )
+    }
+
+
+    val messageFocusRequester =
+        remember {
+            FocusRequester()
+        }
+
+
+    val keyboardController =
+        LocalSoftwareKeyboardController.current
+
+
+    /*
+     * Swipe-to-reply should immediately put the cursor in the composer
+     * and open the software keyboard. The composer is always present,
+     * so requesting focus here is safe once a reply target is selected.
+     */
+    LaunchedEffect(
+        replyingToMessageId
+    ) {
+
+        if (
+            replyingToMessageId != null
+        ) {
+
+            messageFocusRequester.requestFocus()
+            keyboardController?.show()
+        }
     }
 
 
@@ -273,14 +307,16 @@ fun PlexusChatScreen(
 
 
     /*
-     * Keep the chat viewport aware of the software keyboard.
+     * Keep the chat viewport pinned to the newest message while the IME
+     * resizes the window.
      *
-     * Root IME padding means the keyboard reduces the usable chat area
-     * instead of covering the list/composer.
+     * This deliberately follows the changing IME inset while the keyboard
+     * animates. That means the messages are moved upward WITH the keyboard
+     * instead of being covered first and corrected after the animation.
      *
-     * If the user was already at the bottom, keep the newest message pinned
-     * while the IME animates. If they deliberately scrolled upward, do not
-     * yank them back down.
+     * We only pin when the user was already at the bottom. If the user has
+     * deliberately scrolled up to read history, opening the keyboard must not
+     * yank the conversation back to the newest message.
      */
     val density =
         LocalDensity.current
@@ -320,12 +356,9 @@ fun PlexusChatScreen(
 
 
     /*
-     * Opening a long conversation must never visibly animate through old
-     * messages. First position at the newest message with an instant jump
-     * while the list is temporarily transparent.
-     *
-     * Later, new messages auto-scroll only if the user was already near
-     * the bottom.
+     * Opening a conversation starts at the newest message without visibly
+     * animating through the history. New incoming/outgoing messages auto-scroll
+     * only when the user was already near the bottom.
      */
     var initialPositionApplied by
     remember(
@@ -1066,6 +1099,9 @@ fun PlexusChatScreen(
             value =
                 messageValue,
 
+            focusRequester =
+                messageFocusRequester,
+
             onValueChanged = {
                 // Keep the JSON + base64 mesh envelope within Nearby's small BYTES budget.
                 if (it.text.length <= 2_000) messageValue = it
@@ -1464,7 +1500,7 @@ private fun PlexusMessageBubble(
             density
         ) {
 
-            46.dp.toPx()
+            54.dp.toPx()
         }
 
 
@@ -1473,27 +1509,16 @@ private fun PlexusMessageBubble(
             density
         ) {
 
-            62.dp.toPx()
+            70.dp.toPx()
         }
 
 
-    val dragState =
-        rememberDraggableState { delta ->
+    val swipeRevealPx =
+        with(
+            density
+        ) {
 
-            /*
-             * Horizontal draggable participates correctly beside LazyColumn's
-             * vertical scroll. Tiny diagonal/vertical gestures therefore keep
-             * scrolling the chat instead of getting trapped by swipe-to-reply.
-             */
-            swipeOffsetPx =
-                (
-                        swipeOffsetPx +
-                                delta
-                        )
-                    .coerceIn(
-                        0f,
-                        maximumSwipePx
-                    )
+            8.dp.toPx()
         }
 
 
@@ -1504,7 +1529,7 @@ private fun PlexusMessageBubble(
 
         if (
             swipeOffsetPx >
-            4f
+            swipeRevealPx
         ) {
 
             Box(
@@ -1563,17 +1588,137 @@ private fun PlexusMessageBubble(
                     translationX =
                         swipeOffsetPx
                 }
-                .draggable(
-                    state =
-                        dragState,
+                .pointerInput(
+                    message.id
+                ) {
 
-                    orientation =
-                        Orientation.Horizontal,
+                    /*
+                     * Reply is intentionally harder to claim than vertical chat
+                     * scrolling. We do not consume the pointer until movement is
+                     * clearly horizontal. A vertical/diagonal scroll therefore
+                     * stays owned by LazyColumn and the bubble does not twitch.
+                     */
+                    awaitEachGesture {
 
-                    onDragStopped = {
+                        val down =
+                            awaitFirstDown(
+                                requireUnconsumed = false
+                            )
+
+
+                        val touchSlop =
+                            viewConfiguration.touchSlop
+
+
+                        var totalX = 0f
+                        var totalY = 0f
+                        var horizontalReplyDrag = false
+                        var finished = false
+
+
+                        while (
+                            !finished
+                        ) {
+
+                            val event =
+                                awaitPointerEvent()
+
+
+                            val change =
+                                event.changes
+                                    .firstOrNull { pointer ->
+                                        pointer.id == down.id
+                                    }
+                                    ?: break
+
+
+                            if (
+                                !change.pressed
+                            ) {
+
+                                finished = true
+                                break
+                            }
+
+
+                            val delta =
+                                change.positionChange()
+
+
+                            totalX += delta.x
+                            totalY += delta.y
+
+
+                            if (
+                                !horizontalReplyDrag
+                            ) {
+
+                                val horizontalDistance =
+                                    abs(totalX)
+
+                                val verticalDistance =
+                                    abs(totalY)
+
+
+                                /*
+                                 * If vertical intent wins first, abandon reply
+                                 * handling without consuming anything.
+                                 */
+                                if (
+                                    verticalDistance > touchSlop &&
+                                    verticalDistance >= horizontalDistance
+                                ) {
+
+                                    break
+                                }
+
+
+                                /*
+                                 * Require a clearly rightward gesture before the
+                                 * bubble starts moving. The 1.35 ratio filters
+                                 * normal diagonal finger drift during scrolling.
+                                 */
+                                if (
+                                    totalX > touchSlop &&
+                                    horizontalDistance >
+                                    verticalDistance * 1.35f
+                                ) {
+
+                                    horizontalReplyDrag = true
+                                    change.consume()
+
+                                    swipeOffsetPx =
+                                        (
+                                                totalX -
+                                                        touchSlop
+                                                )
+                                            .coerceIn(
+                                                0f,
+                                                maximumSwipePx
+                                            )
+                                }
+
+
+                            } else {
+
+                                change.consume()
+
+                                swipeOffsetPx =
+                                    (
+                                            swipeOffsetPx +
+                                                    delta.x
+                                            )
+                                        .coerceIn(
+                                            0f,
+                                            maximumSwipePx
+                                        )
+                            }
+                        }
+
 
                         val shouldReply =
-                            swipeOffsetPx >=
+                            horizontalReplyDrag &&
+                                    swipeOffsetPx >=
                                     replyThresholdPx
 
 
@@ -1588,7 +1733,7 @@ private fun PlexusMessageBubble(
                             onReply()
                         }
                     }
-                ),
+                },
 
             horizontalArrangement =
                 if (
@@ -1753,7 +1898,7 @@ private fun PlexusMessageBubble(
                                 ),
 
                             fontSize =
-                                15.sp,
+                                16.sp,
 
                             fontWeight =
                                 FontWeight.Normal,
@@ -1791,7 +1936,7 @@ private fun PlexusMessageBubble(
                             ),
 
                         fontSize =
-                            15.sp,
+                            16.sp,
 
                         fontWeight =
                             FontWeight.Normal,
@@ -2588,6 +2733,8 @@ private fun PlexusMessageComposer(
 
     value: TextFieldValue,
 
+    focusRequester: FocusRequester,
+
     onValueChanged: (TextFieldValue) -> Unit,
 
     onSend: () -> Unit
@@ -2620,9 +2767,13 @@ private fun PlexusMessageComposer(
                 onValueChanged,
 
             modifier =
-                Modifier.weight(
-                    1f
-                ),
+                Modifier
+                    .weight(
+                        1f
+                    )
+                    .focusRequester(
+                        focusRequester
+                    ),
 
             placeholder = {
 

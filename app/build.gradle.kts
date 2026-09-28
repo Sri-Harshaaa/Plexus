@@ -1,8 +1,19 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 
     id("com.google.devtools.ksp") version "2.3.10"
+}
+
+val plexusLocalProperties = Properties().apply {
+    rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
+}
+val plexusWebSocketUrl = plexusLocalProperties.getProperty("PLEXUS_WEBSOCKET_URL", "").trim().trimEnd('/')
+require(plexusWebSocketUrl.isEmpty() || (plexusWebSocketUrl.startsWith("wss://") &&
+    plexusWebSocketUrl.none { it == '\"' || it == '\\' || it.isWhitespace() })) {
+    "PLEXUS_WEBSOCKET_URL must be a valid secure WebSocket URL in local.properties"
 }
 
 
@@ -25,6 +36,7 @@ android {
 
         versionCode = 1
         versionName = "1.0"
+        buildConfigField("String", "PLEXUS_WEBSOCKET_URL", "\"$plexusWebSocketUrl\"")
 
         testInstrumentationRunner =
             "androidx.test.runner.AndroidJUnitRunner"
@@ -60,6 +72,7 @@ android {
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 }
 
@@ -131,23 +144,8 @@ dependencies {
     )
 
 
-    /*
-     * SOCKET.IO INTERNET TRANSPORT
-     *
-     * Java client 2.x is compatible with
-     * Socket.IO server 3.x / 4.x.
-     *
-     * org.json is excluded because Android
-     * already provides it.
-     */
-    implementation(
-        "io.socket:socket.io-client:2.1.2"
-    ) {
-        exclude(
-            group = "org.json",
-            module = "json"
-        )
-    }
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 
 
     /*
