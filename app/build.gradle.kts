@@ -15,7 +15,11 @@ require(plexusWebSocketUrl.isEmpty() || (plexusWebSocketUrl.startsWith("wss://")
     plexusWebSocketUrl.none { it == '\"' || it == '\\' || it.isWhitespace() })) {
     "PLEXUS_WEBSOCKET_URL must be a valid secure WebSocket URL in local.properties"
 }
-
+val releaseStoreFile = providers.gradleProperty("PLEXUS_RELEASE_STORE_FILE")
+val releaseStorePassword = providers.gradleProperty("PLEXUS_RELEASE_STORE_PASSWORD")
+val releaseKeyAlias = providers.gradleProperty("PLEXUS_RELEASE_KEY_ALIAS")
+val releaseKeyPassword = providers.gradleProperty("PLEXUS_RELEASE_KEY_PASSWORD")
+val hasReleaseSigning = listOf(releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword).all { it.isPresent }
 
 android {
 
@@ -40,13 +44,23 @@ android {
 
         testInstrumentationRunner =
             "androidx.test.runner.AndroidJUnitRunner"
+   }
+ signingConfigs {
+    if (hasReleaseSigning) {
+        create("release") {
+            storeFile = file(releaseStoreFile.get())
+            storePassword = releaseStorePassword.get()
+            keyAlias = releaseKeyAlias.get()
+            keyPassword = releaseKeyPassword.get()
+        }
     }
-
-
-    buildTypes {
+}
+ buildTypes {
 
         release {
-
+	   if (hasReleaseSigning) {
+    signingConfig = signingConfigs.getByName("release")
+           }
             optimization {
                 enable = true
             }
