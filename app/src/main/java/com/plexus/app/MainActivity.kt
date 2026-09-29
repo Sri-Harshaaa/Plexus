@@ -150,16 +150,23 @@ internal fun shouldSendReadReceipt(
 class MainActivity : ComponentActivity() {
 
     private var serviceBinder by mutableStateOf<PlexusForegroundService.LocalBinder?>(null)
+    private var visibleChatContactNodeId: String? = null
     private var serviceBound = false
     private var firstStartAfterRecreation = false
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
             serviceBinder = binder as? PlexusForegroundService.LocalBinder
+            serviceBinder?.setVisibleChat(visibleChatContactNodeId)
         }
 
         override fun onServiceDisconnected(name: ComponentName) {
             serviceBinder = null
         }
+    }
+
+    private fun setVisibleChat(contactNodeId: String?) {
+        visibleChatContactNodeId = contactNodeId
+        serviceBinder?.setVisibleChat(contactNodeId)
     }
 
     private val transport = object {
@@ -215,12 +222,18 @@ class MainActivity : ComponentActivity() {
     }
 
     override fun onStop() {
+        setVisibleChat(null)
         if (serviceBound) {
             unbindService(serviceConnection)
             serviceBound = false
         }
         serviceBinder = null
         super.onStop()
+    }
+
+    override fun onPause() {
+        setVisibleChat(null)
+        super.onPause()
     }
 
     /*
@@ -235,6 +248,8 @@ class MainActivity : ComponentActivity() {
     mutableStateOf<Uri?>(
         null
     )
+
+    private var pendingConversationContactId by mutableStateOf<String?>(null)
 
 
     override fun onNewIntent(
@@ -253,6 +268,7 @@ class MainActivity : ComponentActivity() {
 
         pendingDeepLinkUri =
             intent.data
+        pendingConversationContactId = conversationContactIdFromIntent(intent)
 
         if (lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
             startAndBindTransport()
@@ -270,6 +286,7 @@ class MainActivity : ComponentActivity() {
 
         pendingDeepLinkUri =
             intent?.data
+        pendingConversationContactId = conversationContactIdFromIntent(intent)
 
 
         setContent {
@@ -563,6 +580,46 @@ class MainActivity : ComponentActivity() {
                         mutableStateOf<ContactEntity?>(
                             null
                         )
+                    }
+
+                    val lifecycleOwner = this@MainActivity
+                    var activityResumed by remember(lifecycleOwner) {
+                        mutableStateOf(
+                            lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+                        )
+                    }
+                    DisposableEffect(lifecycleOwner) {
+                        val observer = LifecycleEventObserver { _, event ->
+                            activityResumed = event == Lifecycle.Event.ON_RESUME
+                        }
+                        lifecycleOwner.lifecycle.addObserver(observer)
+                        onDispose {
+                            lifecycleOwner.lifecycle.removeObserver(observer)
+                            activityResumed = false
+                        }
+                    }
+                    LaunchedEffect(
+                        activityResumed,
+                        currentScreen,
+                        selectedContact?.nodeId,
+                        serviceBinder
+                    ) {
+                        setVisibleChat(
+                            if (activityResumed && currentScreen == PlexusScreen.CHAT) {
+                                selectedContact?.nodeId
+                            } else {
+                                null
+                            }
+                        )
+                    }
+                    LaunchedEffect(pendingConversationContactId) {
+                        val contactNodeId = pendingConversationContactId ?: return@LaunchedEffect
+                        val contact = contactDao.getContactById(contactNodeId)
+                        if (contact != null) {
+                            selectedContact = contact
+                            currentScreen = PlexusScreen.CHAT
+                        }
+                        pendingConversationContactId = null
                     }
 
 

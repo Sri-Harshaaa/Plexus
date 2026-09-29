@@ -45,7 +45,22 @@ interface MessageDao {
     )
     suspend fun insertMessage(
         message: MessageEntity
+    ): Long
+
+
+    @Query(
+        """
+        SELECT *
+        FROM messages
+        WHERE contactNodeId = :contactNodeId
+        ORDER BY timestamp DESC, rowid DESC
+        LIMIT :limit
+        """
     )
+    suspend fun getRecentMessagesForContact(
+        contactNodeId: String,
+        limit: Int
+    ): List<MessageEntity>
 
 
     /*

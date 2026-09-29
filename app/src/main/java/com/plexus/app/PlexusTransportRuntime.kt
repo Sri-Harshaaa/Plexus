@@ -29,6 +29,7 @@ internal class PlexusTransportRuntime(
     private val antiPacketDao = database.antiPacketDao()
     private val connectionRequestDao = database.connectionRequestDao()
     private val conversationStateDao = database.conversationStateDao()
+    private val incomingMessageNotifier = IncomingMessageNotifier(context)
     private val meshRelayStore = MeshRelayStore(database, identity)
     private val antiPacketStore = AntiPacketStore(database, identity.nodeId)
     private val relationshipsHolder = arrayOf<List<ContactEntity>>(emptyList())
@@ -39,11 +40,33 @@ internal class PlexusTransportRuntime(
     private var started = false
     private var initialized = false
     private var stopping = false
+    @Volatile
+    private var visibleChatContactNodeId: String? = null
 
     private fun requireMainThread() {
         check(Looper.myLooper() == Looper.getMainLooper()) {
             "Transport state must be accessed on the main looper"
         }
+    }
+
+    fun setVisibleChat(contactNodeId: String?) {
+        requireMainThread()
+        visibleChatContactNodeId = contactNodeId
+        if (contactNodeId != null) incomingMessageNotifier.cancelConversation(contactNodeId)
+    }
+
+    private suspend fun notifyIncomingMessageIfNeeded(
+        contact: ContactEntity,
+        messageInserted: Boolean
+    ) {
+        if (!messageInserted || !shouldNotifyIncomingMessage(
+                visibleChatContactNodeId, contact.nodeId
+            )) return
+        incomingMessageNotifier.notifyConversation(
+            contact,
+            messageDao.getRecentMessagesForContact(contact.nodeId, 5).asReversed(),
+            visibleChatContactNodeId
+        )
     }
 
     init {
@@ -1252,16 +1275,21 @@ internal class PlexusTransportRuntime(
                                                         /*
                                                      * Store visible chat first, acknowledge second.
                                                      */
-                                                        messageDao
+                                                        val messageInserted = messageDao
                                                             .insertMessage(
                                                                 incomingMessage
-                                                            )
+                                                            ) != -1L
 
 
                                                         conversationStateDao
                                                             .unhideConversation(
                                                                 encryptedPacket.senderNodeId
                                                             )
+
+                                                        notifyIncomingMessageIfNeeded(
+                                                            knownContact,
+                                                            messageInserted
+                                                        )
                                                     }
 
 
@@ -3345,16 +3373,21 @@ internal class PlexusTransportRuntime(
                                                                 /*
                                                              * Store visible chat first, acknowledge second.
                                                              */
-                                                                messageDao
+                                                                val messageInserted = messageDao
                                                                     .insertMessage(
                                                                         incomingMessage
-                                                                    )
+                                                                    ) != -1L
 
 
                                                                 conversationStateDao
                                                                     .unhideConversation(
                                                                         encryptedPacket.senderNodeId
                                                                     )
+
+                                                                notifyIncomingMessageIfNeeded(
+                                                                    knownContact,
+                                                                    messageInserted
+                                                                )
                                                             }
 
 

@@ -71,6 +71,10 @@ class PlexusForegroundService : Service() {
         fun broadcastBytes(bytes: ByteArray, priority: NearbyManager.SendPriority) {
             if (!stopping) runtime?.broadcastBytes(bytes, priority)
         }
+
+        fun setVisibleChat(contactNodeId: String?) {
+            if (!stopping) runtime?.setVisibleChat(contactNodeId)
+        }
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
