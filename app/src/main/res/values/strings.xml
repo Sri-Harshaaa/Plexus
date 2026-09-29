@@ -1,3 +1,7 @@
 <resources>
     <string name="app_name">Plexus</string>
+    <string name="transport_channel_name">Plexus connection</string>
+    <string name="transport_notification_title">Plexus is active</string>
+    <string name="transport_notification_text">Nearby mesh and Internet relay enabled</string>
+    <string name="transport_stop">Stop</string>
 </resources>
