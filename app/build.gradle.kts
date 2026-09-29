@@ -1,4 +1,8 @@
 import java.util.Properties
+import org.gradle.api.DefaultTask
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.TaskAction
 
 plugins {
     alias(libs.plugins.android.application)
@@ -10,10 +14,16 @@ plugins {
 val plexusLocalProperties = Properties().apply {
     rootProject.file("local.properties").takeIf { it.exists() }?.inputStream()?.use { load(it) }
 }
-val plexusWebSocketUrl = plexusLocalProperties.getProperty("PLEXUS_WEBSOCKET_URL", "").trim().trimEnd('/')
+val plexusWebSocketUrl = providers.gradleProperty("PLEXUS_WEBSOCKET_URL")
+    .orElse(providers.environmentVariable("PLEXUS_WEBSOCKET_URL"))
+    .orNull
+    ?.trim()
+    ?.trimEnd('/')
+    ?.takeIf { it.isNotEmpty() }
+    ?: plexusLocalProperties.getProperty("PLEXUS_WEBSOCKET_URL", "").trim().trimEnd('/')
 require(plexusWebSocketUrl.isEmpty() || (plexusWebSocketUrl.startsWith("wss://") &&
     plexusWebSocketUrl.none { it == '\"' || it == '\\' || it.isWhitespace() })) {
-    "PLEXUS_WEBSOCKET_URL must be a valid secure WebSocket URL in local.properties"
+    "PLEXUS_WEBSOCKET_URL must be a valid secure WebSocket URL"
 }
 val releaseStoreFile = providers.gradleProperty("PLEXUS_RELEASE_STORE_FILE")
 val releaseStorePassword = providers.gradleProperty("PLEXUS_RELEASE_STORE_PASSWORD")
@@ -89,8 +99,26 @@ android {
         buildConfig = true
     }
 }
+abstract class VerifyWebSocketUrlTask : DefaultTask() {
+    @get:Input
+    abstract val webSocketUrl: Property<String>
 
+    @TaskAction
+    fun verify() {
+        require(webSocketUrl.get().isNotBlank()) {
+            "PLEXUS_WEBSOCKET_URL must be set for release builds"
+        }
+    }
+}
 
+val verifyReleaseWebSocketUrl =
+    tasks.register<VerifyWebSocketUrlTask>("verifyReleaseWebSocketUrl") {
+        webSocketUrl.set(plexusWebSocketUrl)
+    }
+
+tasks.matching { it.name == "preReleaseBuild" }.configureEach {
+    dependsOn(verifyReleaseWebSocketUrl)
+}
 dependencies {
 
 
