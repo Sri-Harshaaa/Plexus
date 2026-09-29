@@ -10,6 +10,18 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 import android.util.Log
 
+internal fun isTerminalPacketRejection(code: String): Boolean =
+    code.startsWith("PACKET_REJECTED_")
+
+internal fun terminalPacketRejectionCode(serverCode: String): String =
+    when {
+        serverCode.startsWith("INVALID_") -> "PACKET_REJECTED_INVALID"
+        serverCode.endsWith("_MISMATCH") -> "PACKET_REJECTED_MISMATCH"
+        serverCode.endsWith("_CONFLICT") -> "PACKET_REJECTED_CONFLICT"
+        serverCode.endsWith("_EXPIRED") -> "PACKET_REJECTED_EXPIRED"
+        else -> "PACKET_REJECTED"
+    }
+
 /** All state is confined to Scheduler. Room remains the durable outbound owner. */
 internal class InternetSession(
     private val url: String,
@@ -93,9 +105,7 @@ internal class InternetSession(
 
                                 Log.e(
                                     "PlexusInternet",
-                                    "NON_PLEXUS_SERVER_FRAME -> " +
-                                            "keys=${envelope.keys().asSequence().toList()} " +
-                                            "message=${envelope.optString("message", "")}"
+                                    "NON_PLEXUS_SERVER_FRAME"
                                 )
 
                                 return@current
@@ -182,7 +192,7 @@ internal class InternetSession(
                 if (authenticated && offer != null && envelope.optString("requestId") == offer.id &&
                     (code.startsWith("INVALID_") || code.endsWith("_MISMATCH") || code.endsWith("_CONFLICT") || code.endsWith("_EXPIRED"))) {
                     cancelTimer(); inFlight = null; offers.remove(offer.key)
-                    observer.error("PACKET_REJECTED")
+                    observer.error(terminalPacketRejectionCode(code))
                     drain()
                 } else fail(generation, "SERVER_RETRY_REQUIRED")
             }

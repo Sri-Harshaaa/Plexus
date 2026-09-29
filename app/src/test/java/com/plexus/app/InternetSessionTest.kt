@@ -40,6 +40,7 @@ class InternetSessionTest {
         val received = CopyOnWriteArrayList<JSONObject>()
         var socket: WebSocket? = null
         var acknowledge = true
+        var terminalRejection: String? = null
         var validSignature = false
         override fun onOpen(webSocket: WebSocket, response: Response) { socket = webSocket }
         override fun onMessage(webSocket: WebSocket, text: String) {
@@ -53,7 +54,17 @@ class InternetSessionTest {
                     }
                     event("auth:success", JSONObject().put("nodeId", node)); event("sync:complete", JSONObject())
                 }
-                "sendPacket", "deliveryProof" -> if (acknowledge) ack(json.getString("requestId"))
+                "sendPacket", "deliveryProof" -> {
+                    val code = terminalRejection
+                    if (code != null) {
+                        terminalRejection = null
+                        socket!!.send(JSONObject().put("event", "internet:error")
+                            .put("requestId", json.getString("requestId"))
+                            .put("data", JSONObject().put("error", code)).toString())
+                    } else if (acknowledge) {
+                        ack(json.getString("requestId"))
+                    }
+                }
                 "sync" -> event("sync:complete", JSONObject())
             }
         }
@@ -70,6 +81,7 @@ class InternetSessionTest {
         }, clock, object : InternetSession.Observer {
             override fun authenticated() { events.add("authenticated") }
             override fun disconnected() { events.add("disconnected") }
+            override fun error(code: String) { events.add("error:$code") }
             override fun event(name: String, packet: JSONObject) { events.add(name) }
         }, now = { clock.now })
         try { session.start(); clock.await { session.authenticated }; block(session, clock, peer, server, events) }
@@ -87,6 +99,14 @@ class InternetSessionTest {
         assertTrue(session.offer("message:id", "sendPacket", packet, clock.now + 100000))
         assertEquals(1, peer.received.count { it.optString("action") == "sendPacket" })
         assertEquals(listOf("authenticated"), events)
+    }
+    @Test fun terminalServerRejectionRemovesOnlyThatOfferWithoutDisconnecting() = scenario { session, clock, peer, _, events ->
+        peer.terminalRejection = "MESSAGE_ID_CONFLICT"
+        assertTrue(session.offer("message:id", "sendPacket", JSONObject().put("packetId", "stable-id"), clock.now + 100000))
+        clock.await { events.contains("error:PACKET_REJECTED_CONFLICT") }
+        assertTrue(session.authenticated)
+        assertTrue(session.offer("message:id", "sendPacket", JSONObject().put("packetId", "stable-id"), clock.now + 100000))
+        clock.await { peer.received.count { it.optString("action") == "sendPacket" } == 2 }
     }
     @Test fun missingPersistenceAckReconnectsAndRetainsSameLogicalPacket() = scenario { session, clock, peer, server, events ->
         peer.acknowledge = false

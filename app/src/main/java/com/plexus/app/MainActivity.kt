@@ -964,8 +964,7 @@ class MainActivity : ComponentActivity() {
 
                             Log.e(
                                 "PlexusContact",
-                                "DEEP LINK REJECTED - INVALID PLEXUS CONNECT URI -> " +
-                                        deepLinkUri
+                                "DEEP LINK REJECTED - INVALID PLEXUS CONNECT URI"
                             )
 
 

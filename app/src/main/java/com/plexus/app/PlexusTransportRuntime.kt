@@ -1607,6 +1607,15 @@ internal class PlexusTransportRuntime(
                                         ) {
 
                                             if (
+                                                isTerminalPacketRejection(
+                                                    message
+                                                )
+                                            ) {
+
+                                                return
+                                            }
+
+                                            if (
                                                 exception != null
                                             ) {
 
