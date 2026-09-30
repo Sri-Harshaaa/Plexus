@@ -19,3 +19,7 @@ plexus-server/
 .idea/
 /Plexus.zip
 /codex-final-report.md
+
+# Firebase local config / generated release artifacts
+/app/google-services.json
+/app/release/

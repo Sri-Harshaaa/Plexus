@@ -121,6 +121,14 @@
             android:exported="false"
             android:foregroundServiceType="connectedDevice|remoteMessaging" />
 
+        <service
+            android:name=".PlexusFirebaseMessagingService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
 
         <activity
             android:name=".MainActivity"

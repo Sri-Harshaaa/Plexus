@@ -15,6 +15,7 @@ class InternetManager(
         fun onConnected() {}
         fun onAuthenticated() {}
         fun onRetryPending() {}
+        fun onSyncComplete(busy: Boolean) {}
         fun onDisconnected() {}
         fun onMeshPacketReceived(packet: NearbyMeshPacket) {}
         fun onAntiPacketReceived(packet: NearbyAntiPacket) {}
@@ -33,6 +34,7 @@ class InternetManager(
             override fun authenticated() { Log.d(TAG, "WSS AUTHENTICATED"); listener.onAuthenticated() }
             override fun disconnected() { listener.onDisconnected() }
             override fun error(code: String) { Log.w(TAG, code); listener.onError(code) }
+            override fun syncComplete(busy: Boolean) { listener.onSyncComplete(busy) }
             override fun event(name: String, packet: JSONObject) {
                 val bytes = packet.toString().toByteArray(Charsets.UTF_8)
                 when (name) {
@@ -77,6 +79,7 @@ class InternetManager(
         listener.onRetryPending()
         session.requestSync()
     }
+    fun registerPushToken(token: String): Boolean = session.registerPushToken(token)
     fun stop() { session.stop(); handler.removeCallbacksAndMessages(null) }
     companion object { private const val TAG = "PlexusInternet" }
 }

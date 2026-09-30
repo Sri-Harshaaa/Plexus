@@ -38,7 +38,6 @@ class PlexusForegroundService : Service() {
 
     private val status = MutableStateFlow(TransportStatus.STOPPED)
     private val binder = LocalBinder()
-    private var runtime: PlexusTransportRuntime? = null
     private var stopping = false
     private var stoppedAtNanos = Long.MIN_VALUE
 
@@ -46,34 +45,31 @@ class PlexusForegroundService : Service() {
         val transportStatus: StateFlow<TransportStatus> get() = status
 
         fun startNearbyIfPermitted() {
-            if (!stopping) runtime?.startNearbyIfPermitted()
+            if (!stopping) PlexusPersonalMessaging.startNearbyIfPermitted()
         }
 
-        fun sendMeshPacket(packet: NearbyMeshPacket): Boolean =
-            if (!stopping) runtime?.sendMeshPacket(packet) ?: false else false
-
         fun sendConnectionRequest(packet: ConnectionRequestPacket): Boolean =
-            if (!stopping) runtime?.sendConnectionRequest(packet) ?: false else false
+            if (!stopping) PlexusPersonalMessaging.sendConnectionRequest(packet) else false
 
         fun sendConnectionResponse(packet: ConnectionResponsePacket): Boolean =
-            if (!stopping) runtime?.sendConnectionResponse(packet) ?: false else false
+            if (!stopping) PlexusPersonalMessaging.sendConnectionResponse(packet) else false
 
         fun isNodeVerified(nodeId: String): Boolean =
-            if (!stopping) runtime?.isNodeVerified(nodeId) ?: false else false
+            if (!stopping) PlexusPersonalMessaging.isNodeVerified(nodeId) else false
 
         fun sendBytesToNode(
             nodeId: String,
             bytes: ByteArray,
             priority: NearbyManager.SendPriority
         ): Boolean =
-            if (!stopping) runtime?.sendBytesToNode(nodeId, bytes, priority) ?: false else false
+            if (!stopping) PlexusPersonalMessaging.sendBytesToNode(nodeId, bytes, priority) else false
 
         fun broadcastBytes(bytes: ByteArray, priority: NearbyManager.SendPriority) {
-            if (!stopping) runtime?.broadcastBytes(bytes, priority)
+            if (!stopping) PlexusPersonalMessaging.broadcastBytes(bytes, priority)
         }
 
         fun setVisibleChat(contactNodeId: String?) {
-            if (!stopping) runtime?.setVisibleChat(contactNodeId)
+            PlexusPersonalMessaging.setVisibleChat(contactNodeId)
         }
     }
 
@@ -108,29 +104,21 @@ class PlexusForegroundService : Service() {
             return START_NOT_STICKY
         }
 
-        if (runtime != null) return START_STICKY
-
         try {
             promoteToForeground()
             status.value = TransportStatus.STARTING
-            val displayName = ProfileManager.getDisplayName(applicationContext)
+            ProfileManager.getDisplayName(applicationContext)
                 ?.takeIf { ProfileManager.isSetupComplete(applicationContext) }
                 ?: error("Plexus profile is not ready")
-            val identity = IdentityManager.getOrCreateIdentity(displayName)
-            val database = PlexusDatabase.getDatabase(applicationContext)
-            val newRuntime = PlexusTransportRuntime(applicationContext, identity, database)
-            runtime = newRuntime
-            newRuntime.start(
-                onStarted = {
-                    if (!stopping && runtime === newRuntime) {
-                        status.value = TransportStatus.RUNNING
+            PlexusPersonalMessaging.startNetworkParticipation(
+                applicationContext,
+                onStarted = { if (!stopping) status.value = TransportStatus.RUNNING },
+                onFailed = { failure ->
+                    if (!stopping) {
+                        Log.e("PlexusService", "Personal messaging startup failed", failure)
+                        preferences.edit().putBoolean(KEY_ENABLED, false).commit()
+                        shutdown(stopService = true)
                     }
-                },
-                onFailed = failureHandler@ { failure ->
-                    if (stopping || runtime !== newRuntime) return@failureHandler
-                    Log.e("PlexusService", "Transport initialization failed", failure)
-                    preferences.edit().putBoolean(KEY_ENABLED, false).commit()
-                    shutdown(stopService = true)
                 }
             )
         } catch (exception: Exception) {
@@ -187,9 +175,8 @@ class PlexusForegroundService : Service() {
             stopping = true
             stoppedAtNanos = SystemClock.elapsedRealtimeNanos()
             status.value = TransportStatus.STOPPED
-            runCatching { runtime?.shutdown() }
+            runCatching { PlexusPersonalMessaging.stopNetworkParticipation() }
                 .onFailure { Log.e("PlexusService", "Transport shutdown failed", it) }
-            runtime = null
             runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
                 .onFailure { Log.e("PlexusService", "Foreground removal failed", it) }
         }

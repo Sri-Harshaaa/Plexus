@@ -48,6 +48,19 @@ test('unauthenticated send, sync and proof are rejected', async () => {
     const s = setup(); await s.call('a', '$connect');
     for (const action of ['sendPacket', 'sync', 'deliveryProof']) { await s.call('a', action); assert.equal(s.error(), 'NOT_AUTHENTICATED'); }
 });
+test('push token is bound only to the authenticated connection identity', async () => {
+    const s = setup(), a = identity(); await s.call('a', '$connect');
+    await s.call('a', 'registerPushToken', { token: 'x'.repeat(40) }); assert.equal(s.error(), 'NOT_AUTHENTICATED');
+    await s.auth('a', a); await s.call('a', 'registerPushToken', { token: 'x'.repeat(40) });
+    assert.deepEqual(await s.store.pushTokens(a.nodeId), ['x'.repeat(40)]);
+    await s.call('a', 'registerPushToken', { token: 'y'.repeat(40) });
+    assert.deepEqual(await s.store.pushTokens(a.nodeId), ['y'.repeat(40)]);
+});
+test('offline durable message triggers a sync wake but live delivery does not', async () => {
+    const s = setup(), a = identity(), b = identity(); await s.auth('a', a);
+    await s.call('a', 'sendPacket', { packet: message(a, b, s.now()) }); assert.deepEqual(s.pushes, [b.nodeId]);
+    await s.auth('b', b); await s.call('a', 'sendPacket', { packet: message(a, b, s.now()) }); assert.deepEqual(s.pushes, [b.nodeId]);
+});
 test('offline message is durably queued before accepted acknowledgement', async () => {
     const s = setup(), a = identity(), b = identity(); await s.auth('a', a); s.store.trace.length = 0;
     const p = message(a, b, s.now()); await s.call('a', 'sendPacket', { packet: p });

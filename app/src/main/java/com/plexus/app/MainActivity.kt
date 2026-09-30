@@ -166,18 +166,18 @@ class MainActivity : ComponentActivity() {
 
     private fun setVisibleChat(contactNodeId: String?) {
         visibleChatContactNodeId = contactNodeId
-        serviceBinder?.setVisibleChat(contactNodeId)
+        PlexusPersonalMessaging.setVisibleChat(contactNodeId)
     }
 
     private val transport = object {
         fun sendMeshPacket(packet: NearbyMeshPacket) =
-            serviceBinder?.sendMeshPacket(packet) ?: false
+            PlexusPersonalMessaging.sendOwnMeshPacket(packet)
 
         fun sendConnectionRequest(packet: ConnectionRequestPacket) =
-            serviceBinder?.sendConnectionRequest(packet) ?: false
+            PlexusPersonalMessaging.sendConnectionRequest(packet)
 
         fun sendConnectionResponse(packet: ConnectionResponsePacket) =
-            serviceBinder?.sendConnectionResponse(packet) ?: false
+            PlexusPersonalMessaging.sendConnectionResponse(packet)
 
         fun isNodeVerified(nodeId: String) =
             serviceBinder?.isNodeVerified(nodeId) ?: false
@@ -193,6 +193,7 @@ class MainActivity : ComponentActivity() {
     private fun startAndBindTransport() {
         if (!ProfileManager.isSetupComplete(applicationContext) ||
             ProfileManager.getDisplayName(applicationContext).isNullOrBlank()) return
+        PlexusPersonalMessaging.start(applicationContext)
         val intent = Intent(this, PlexusForegroundService::class.java)
             .setAction(PlexusForegroundService.ACTION_START)
             .putExtra(
@@ -6518,6 +6519,15 @@ fun PlexusProfileScreen(
 
             fontSize =
                 11.sp
+        )
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        Text(
+            text = "If offline messaging or relay stops working while your screen is off, your phone may be restricting Plexus in the background. Check battery optimization settings.",
+            color = PlexusMuted,
+            fontSize = 11.sp,
+            textAlign = TextAlign.Center
         )
 
 

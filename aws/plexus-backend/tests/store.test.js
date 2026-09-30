@@ -67,6 +67,29 @@ test('sync query is strongly consistent, bounded, ordered and excludes metadata 
     assert.equal(input.ExpressionAttributeValues[':upper'], '3');
     assert.equal(input.ScanIndexForward, undefined); assert.equal(input.IndexName, undefined);
 });
+test('pending page excludes a registered PUSH_TOKEN row in the same recipient partition', async () => {
+    const registration = setup();
+    await registration.store.registerPushToken('node', 'test-push-token', Date.now());
+    const push = registration.calls[0].input.Item;
+    assert.equal(push.packetType, 'PUSH_TOKEN');
+    assert.match(push.packetKey, /^8#PUSH#/);
+    const packets = ['0#proof', '1#request', '2#message'].map(packetKey => ({ destinationNodeId: 'node', packetKey }));
+    const rows = [...packets, push, { destinationNodeId: 'other-node', packetKey: '2#other' }];
+    const store = new DynamoStore({ async send(command) {
+        assert.equal(command.constructor.name, 'QueryCommand');
+        assert.equal(command.input.TableName, registration.calls[0].input.TableName);
+        assert.equal(command.input.ConsistentRead, true);
+        assert.equal(command.input.KeyConditionExpression, 'destinationNodeId = :node AND packetKey < :upper');
+        const values = command.input.ExpressionAttributeValues;
+        assert.equal(values[':node'], 'node');
+        assert.equal(values[':upper'], '3');
+        // Apply DynamoDB's actual partition/range predicate to mixed stored rows.
+        return { Items: rows.filter(item => item.destinationNodeId === values[':node'] && item.packetKey < values[':upper']) };
+    } }, tables);
+    const page = await store.page('node', undefined);
+    assert.deepEqual(page.items, packets);
+    assert.equal(page.items.some(item => item.packetType === 'PUSH_TOKEN'), false);
+});
 test('auth success condition consumes the exact unexpired challenge and removes it', async () => {
     const s = setup(); await s.store.authenticate('c', { connectedAt: 1000, claimedNodeId: 'node', challengeId: 'challenge' }, 2000);
     const input = s.calls[0].input;

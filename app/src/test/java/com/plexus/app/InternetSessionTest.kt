@@ -54,7 +54,7 @@ class InternetSessionTest {
                     }
                     event("auth:success", JSONObject().put("nodeId", node)); event("sync:complete", JSONObject())
                 }
-                "sendPacket", "deliveryProof" -> {
+                "sendPacket", "deliveryProof", "registerPushToken" -> {
                     val code = terminalRejection
                     if (code != null) {
                         terminalRejection = null
@@ -107,6 +107,12 @@ class InternetSessionTest {
         assertTrue(session.authenticated)
         assertTrue(session.offer("message:id", "sendPacket", JSONObject().put("packetId", "stable-id"), clock.now + 100000))
         clock.await { peer.received.count { it.optString("action") == "sendPacket" } == 2 }
+    }
+    @Test fun pushRegistrationUsesTheAuthenticatedControlQueue() = scenario { session, clock, peer, _, _ ->
+        assertTrue(session.registerPushToken("x".repeat(40)))
+        clock.await { peer.received.any { it.optString("action") == "registerPushToken" } }
+        assertEquals("x".repeat(40), peer.received.last { it.optString("action") == "registerPushToken" }
+            .getString("token"))
     }
     @Test fun missingPersistenceAckReconnectsAndRetainsSameLogicalPacket() = scenario { session, clock, peer, server, events ->
         peer.acknowledge = false

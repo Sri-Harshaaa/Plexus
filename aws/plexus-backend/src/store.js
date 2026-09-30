@@ -1,4 +1,5 @@
 import { GetCommand, PutCommand, UpdateCommand, DeleteCommand, QueryCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { createHash } from 'node:crypto';
 
 export const conditional = e => e?.name === 'ConditionalCheckFailedException' ||
     (e?.name === 'TransactionCanceledException' && e.CancellationReasons?.some(r => r.Code === 'ConditionalCheckFailed') &&
@@ -106,6 +107,25 @@ export class DynamoStore {
     }
     async deletePending(node, key) {
         await this.db.send(new DeleteCommand({ TableName: this.tables.pending, Key: { destinationNodeId: node, packetKey: key } }));
+    }
+    pushKey(token) { return `8#PUSH#${createHash('sha256').update(token).digest('hex')}`; }
+    async registerPushToken(node, token, now) {
+        await this.db.send(new PutCommand({ TableName: this.tables.pending, Item: {
+            destinationNodeId: node, packetKey: this.pushKey(token), packetType: 'PUSH_TOKEN', token,
+            expiresAt: now + 400 * 24 * 60 * 60_000, ttl: Math.floor((now + 400 * 24 * 60 * 60_000) / 1000)
+        } }));
+        for (const oldToken of await this.pushTokens(node)) {
+            if (oldToken !== token) await this.deletePushToken(node, oldToken);
+        }
+    }
+    async pushTokens(node) {
+        const result = await this.db.send(new QueryCommand({ TableName: this.tables.pending,
+            KeyConditionExpression: 'destinationNodeId = :node AND begins_with(packetKey, :prefix)',
+            ExpressionAttributeValues: { ':node': node, ':prefix': '8#PUSH#' } }));
+        return (result.Items ?? []).filter(item => item.expiresAt > Date.now() && typeof item.token === 'string').map(item => item.token);
+    }
+    async deletePushToken(node, token) {
+        await this.db.send(new DeleteCommand({ TableName: this.tables.pending, Key: { destinationNodeId: node, packetKey: this.pushKey(token) } }));
     }
     async saveControl(item, markerKey) {
         const marker = { ...item, packetKey: markerKey, pendingKey: item.packetKey };

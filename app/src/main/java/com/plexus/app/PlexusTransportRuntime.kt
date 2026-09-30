@@ -38,6 +38,10 @@ internal class PlexusTransportRuntime(
     private lateinit var internetManager: InternetManager
     private lateinit var nearbyManager: NearbyManager
     private var started = false
+    private var networkParticipationStarted = false
+    private var nearbyRetryJob: Job? = null
+    private var internetRetryJob: Job? = null
+    private val pendingSyncCallbacks = mutableListOf<() -> Unit>()
     private var initialized = false
     private var stopping = false
     @Volatile
@@ -457,6 +461,9 @@ internal class PlexusTransportRuntime(
                                                 "SERVER AUTH COMPLETE ✅ 🔐 🌐"
                                             )
 
+                                            PlexusPushToken.get(context)?.let {
+                                                internetManagerHolder[0]?.registerPushToken(it)
+                                            }
                                             onRetryPending()
                                         }
 
@@ -510,6 +517,13 @@ internal class PlexusTransportRuntime(
                                                     }
                                                     internetUploadOffset[0] = if (pendingInternetPackets.size < 32) 0
                                                         else internetUploadOffset[0] + pendingInternetPackets.size
+                                                    // Personal delivery continues after the user stops
+                                                    // network participation; opaque third-party relay does not.
+                                                    if (!networkParticipationStarted) {
+                                                        pendingInternetPackets = pendingInternetPackets.filter {
+                                                            it.sourceNodeId == identity.nodeId
+                                                        }
+                                                    }
 
 
                                                     var retriedPacketCount =
@@ -521,6 +535,9 @@ internal class PlexusTransportRuntime(
                                                     pendingInternetPackets
                                                     ) {
                                                         delay(75L)
+
+                                                        if (!networkParticipationStarted &&
+                                                            meshPacket.sourceNodeId != identity.nodeId) continue
 
 
                                                         /*
@@ -866,6 +883,13 @@ internal class PlexusTransportRuntime(
                                                     )
                                                 }
                                             }
+                                        }
+
+                                        override fun onSyncComplete(busy: Boolean) {
+                                            if (busy) return
+                                            val callbacks = pendingSyncCallbacks.toList()
+                                            pendingSyncCallbacks.clear()
+                                            callbacks.forEach { it() }
                                         }
 
 
@@ -1369,13 +1393,11 @@ internal class PlexusTransportRuntime(
                                                                     )
 
 
-                                                                nearbyManagerHolder[
-                                                                    0
-                                                                ]
-                                                                    ?.broadcastBytes(
-                                                                        deliveryAntiPacket
-                                                                            .toBytes()
+                                                                if (networkParticipationStarted) {
+                                                                    nearbyManagerHolder[0]?.broadcastBytes(
+                                                                        deliveryAntiPacket.toBytes()
                                                                     )
+                                                                }
 
 
                                                                 Log.d(
@@ -1484,13 +1506,9 @@ internal class PlexusTransportRuntime(
                                                          * Duplicate vaccines will not be
                                                          * rebroadcast when they come back.
                                                          */
-                                                            nearbyManagerHolder[
-                                                                0
-                                                            ]
-                                                                ?.broadcastBytes(
-                                                                    packet
-                                                                        .toBytes()
-                                                                )
+                                                            if (networkParticipationStarted) {
+                                                                nearbyManagerHolder[0]?.broadcastBytes(packet.toBytes())
+                                                            }
 
 
                                                             Log.d(
@@ -3563,7 +3581,9 @@ internal class PlexusTransportRuntime(
 
                                                             MeshRelayStore.StoreResult.STORED -> {
 
-                                                                internetManagerHolder[0]?.sendMeshPacket(meshPacket)
+                                                                if (networkParticipationStarted) {
+                                                                    internetManagerHolder[0]?.sendMeshPacket(meshPacket)
+                                                                }
 
 
                                                                 Log.d(
@@ -3702,7 +3722,7 @@ internal class PlexusTransportRuntime(
         this.nearbyManager = nearbyManager
     }
 
-    fun start(onStarted: () -> Unit, onFailed: (Throwable) -> Unit) {
+    fun startPersonalMessaging(onStarted: () -> Unit, onFailed: (Throwable) -> Unit) {
         requireMainThread()
         if (started || stopping) return
         started = true
@@ -3720,21 +3740,8 @@ internal class PlexusTransportRuntime(
                         onFailed(failure)
                     }
                 }
-                if (NearbyPermissions.hasAllPermissions(context)) startNearbyIfPermitted()
                 internetManager.start()
-                coroutineScope.launch(Dispatchers.Main.immediate) {
-                    while (true) {
-                        delay(5_000L)
-                        try {
-                            retryNearbyPackets(nearbyManager, meshRelayStore, antiPacketStore, identity.nodeId)
-                        } catch (cancelled: kotlinx.coroutines.CancellationException) {
-                            throw cancelled
-                        } catch (exception: Exception) {
-                            Log.e("PlexusNearby", "DURABLE RETRY FAILED", exception)
-                        }
-                    }
-                }
-                coroutineScope.launch(Dispatchers.Main.immediate) {
+                internetRetryJob = coroutineScope.launch(Dispatchers.Main.immediate) {
                     while (true) {
                         delay(30_000L)
                         if (!internetManager.isAuthenticated()) continue
@@ -3766,14 +3773,61 @@ internal class PlexusTransportRuntime(
 
     fun startNearbyIfPermitted() {
         requireMainThread()
-        if (!initialized || stopping || !NearbyPermissions.hasAllPermissions(context)) return
+        if (!initialized || stopping || !networkParticipationStarted || !NearbyPermissions.hasAllPermissions(context)) return
         nearbyManager.startAdvertising()
         nearbyManager.startDiscovery()
     }
 
-    fun sendMeshPacket(packet: NearbyMeshPacket): Boolean {
+    fun startNetworkParticipation() {
         requireMainThread()
-        return if (initialized && !stopping) internetManager.sendMeshPacket(packet) else false
+        if (!initialized || stopping || networkParticipationStarted) return
+        networkParticipationStarted = true
+        startNearbyIfPermitted()
+        nearbyRetryJob = coroutineScope.launch(Dispatchers.Main.immediate) {
+            while (true) {
+                delay(5_000L)
+                try {
+                    retryNearbyPackets(nearbyManager, meshRelayStore, antiPacketStore, identity.nodeId)
+                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                    throw cancelled
+                } catch (exception: Exception) {
+                    Log.e("PlexusNearby", "DURABLE RETRY FAILED", exception)
+                }
+            }
+        }
+    }
+
+    fun stopNetworkParticipation() {
+        requireMainThread()
+        if (!networkParticipationStarted) return
+        networkParticipationStarted = false
+        nearbyRetryJob?.cancel()
+        nearbyRetryJob = null
+        nearbyManager.stopEverything()
+    }
+
+    fun sendOwnMeshPacket(packet: NearbyMeshPacket): Boolean {
+        requireMainThread()
+        return if (packet.sourceNodeId == identity.nodeId && initialized && !stopping) {
+            internetManager.sendMeshPacket(packet)
+        } else false
+    }
+
+    fun retryPersonalPending() {
+        requireMainThread()
+        if (initialized && !stopping) internetManager.retryPending()
+    }
+
+    fun syncPersonalPending(onComplete: () -> Unit) {
+        requireMainThread()
+        if (!initialized || stopping) return
+        pendingSyncCallbacks += onComplete
+        internetManager.retryPending()
+    }
+
+    fun registerPushToken(token: String): Boolean {
+        requireMainThread()
+        return initialized && !stopping && internetManager.registerPushToken(token)
     }
 
     fun sendConnectionRequest(packet: ConnectionRequestPacket): Boolean {
@@ -3788,17 +3842,17 @@ internal class PlexusTransportRuntime(
 
     fun isNodeVerified(nodeId: String): Boolean {
         requireMainThread()
-        return initialized && !stopping && nearbyManager.isNodeVerified(nodeId)
+        return initialized && !stopping && networkParticipationStarted && nearbyManager.isNodeVerified(nodeId)
     }
 
     fun sendBytesToNode(nodeId: String, bytes: ByteArray, priority: NearbyManager.SendPriority): Boolean {
         requireMainThread()
-        return if (initialized && !stopping) nearbyManager.sendBytesToNode(nodeId, bytes, priority) else false
+        return if (initialized && !stopping && networkParticipationStarted) nearbyManager.sendBytesToNode(nodeId, bytes, priority) else false
     }
 
     fun broadcastBytes(bytes: ByteArray, priority: NearbyManager.SendPriority) {
         requireMainThread()
-        if (initialized && !stopping) nearbyManager.broadcastBytes(bytes, priority)
+        if (initialized && !stopping && networkParticipationStarted) nearbyManager.broadcastBytes(bytes, priority)
     }
 
     fun shutdown() {
@@ -3806,7 +3860,10 @@ internal class PlexusTransportRuntime(
         if (stopping) return
         stopping = true
         initialized = false
+        networkParticipationStarted = false
         internetSyncJob[0]?.cancel()
+        nearbyRetryJob?.cancel()
+        internetRetryJob?.cancel()
         coroutineScope.cancel()
         try {
             nearbyManager.stopEverything()

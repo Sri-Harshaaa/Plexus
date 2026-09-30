@@ -9,6 +9,7 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 
     id("com.google.devtools.ksp") version "2.3.10"
+    id("com.google.gms.google-services")
 }
 
 val plexusLocalProperties = Properties().apply {
@@ -189,6 +190,17 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
 
+    /*
+    * FIREBASE CLOUD MESSAGING
+    */
+    implementation(
+        platform("com.google.firebase:firebase-bom:34.19.0")
+    )
+
+    implementation(
+        "com.google.firebase:firebase-messaging"
+    )
+    implementation("androidx.work:work-runtime-ktx:2.10.3")
 
     /*
      * ROOM DATABASE

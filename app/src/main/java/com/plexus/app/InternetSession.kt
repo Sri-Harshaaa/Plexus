@@ -40,6 +40,7 @@ internal class InternetSession(
         fun authenticated() {}
         fun disconnected() {}
         fun event(name: String, packet: JSONObject) {}
+        fun syncComplete(busy: Boolean) {}
         fun error(code: String) {}
     }
     private data class Offer(val key: String, val action: String, val packet: JSONObject,
@@ -184,7 +185,7 @@ internal class InternetSession(
                 syncTimer = null
                 syncing = false
                 val cursor = data.optString("cursor")
-                if (cursor.isNotEmpty()) requestSync(cursor)
+                if (cursor.isNotEmpty()) requestSync(cursor) else observer.syncComplete(data.optBoolean("busy", false))
             }
             "internet:error" -> {
                 val code = data.optString("error", "SERVER_ERROR").take(80)
@@ -215,7 +216,10 @@ internal class InternetSession(
         return true
     }
     private fun wire(offer: Offer) = JSONObject().put("action", offer.action)
-        .put("requestId", offer.id).put("packet", offer.packet)
+        .put("requestId", offer.id).apply {
+            if (offer.action == "registerPushToken") put("token", offer.packet.getString("token"))
+            else put("packet", offer.packet)
+        }
     private fun drain() {
         if (!authenticated || inFlight != null) return
         offers.entries.removeAll { it.value.expiresAt <= now() }
@@ -238,6 +242,8 @@ internal class InternetSession(
         syncTimer = task
         scheduler.later(task, 200)
     }
+    fun registerPushToken(token: String): Boolean =
+        token.length in 20..4096 && offer("push:$token", "registerPushToken", JSONObject().put("token", token), now() + 86_400_000L)
     private fun armSyncTimeout() {
         syncTimer?.let(scheduler::cancel)
         val token = generation

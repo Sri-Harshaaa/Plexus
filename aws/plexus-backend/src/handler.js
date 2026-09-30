@@ -7,7 +7,7 @@ const proofMeta = p => ({ type: 'DELIVERY_PROOF', id: p.messageId, source: p.rec
     destination: p.sourceNodeId, priority: 0, event: 'internet:anti_packet' });
 const sameBinding = (v, source, destination) => !v || (v.sourceNodeId === source && v.recipientNodeId === destination);
 
-export function createHandler({ store, transport, now = Date.now, log = console }) {
+export function createHandler({ store, transport, push = async () => {}, now = Date.now, log = console }) {
     return async event => {
         const ctx = event.requestContext ?? {};
         const id = ctx.connectionId;
@@ -27,14 +27,16 @@ export function createHandler({ store, transport, now = Date.now, log = console 
         }
         async function live(node, name, payload) {
             const deadline = now() + 10_000;
+            let sent = false;
             for await (const connectionId of store.online(node)) {
                 if (now() > deadline) break;
                 // GSI is eventually consistent; base-row identity and expiry are authoritative.
                 const current = await store.connection(connectionId);
                 if (!current?.authenticated || current.nodeId !== node || current.expiresAt <= now()) continue;
-                try { await send(connectionId, name, payload); }
+                try { sent = await send(connectionId, name, payload) || sent; }
                 catch { log.warn(JSON.stringify({ event: 'live_deferred' })); }
             }
+            return sent;
         }
         async function sync(state, encoded = '') {
             let cursor;
@@ -105,7 +107,7 @@ export function createHandler({ store, transport, now = Date.now, log = console 
             try { body = JSON.parse(event.body); } catch { throw new ProtocolError('INVALID_JSON'); }
             requireProtocol(body && typeof body === 'object' && !Array.isArray(body), 'INVALID_JSON');
             if (typeof body.requestId === 'string' && body.requestId.length <= 128) requestId = body.requestId;
-            requireProtocol(['authInit', 'authProof', 'sendPacket', 'deliveryProof', 'sync'].includes(ctx.routeKey) &&
+            requireProtocol(['authInit', 'authProof', 'sendPacket', 'deliveryProof', 'sync', 'registerPushToken'].includes(ctx.routeKey) &&
                 body.action === ctx.routeKey, 'INVALID_ACTION');
             const state = await store.connection(id);
             requireProtocol(state && state.expiresAt > now(), 'CONNECTION_EXPIRED');
@@ -129,6 +131,11 @@ export function createHandler({ store, transport, now = Date.now, log = console 
             } else {
                 requireProtocol(state.authenticated && state.nodeId, 'NOT_AUTHENTICATED');
                 if (ctx.routeKey === 'sync') await sync(state, body.cursor);
+                else if (ctx.routeKey === 'registerPushToken') {
+                    requireProtocol(typeof body.token === 'string' && /^[A-Za-z0-9:_-]{20,4096}$/.test(body.token), 'INVALID_PUSH_TOKEN');
+                    await store.registerPushToken(state.nodeId, body.token, now());
+                    await send(id, 'internet:ack', { accepted: true }, requestId);
+                }
                 else if (ctx.routeKey === 'sendPacket') {
                     const packet = body.packet;
                     const meta = validatePacket(packet, now());
@@ -186,7 +193,11 @@ export function createHandler({ store, transport, now = Date.now, log = console 
                             item = { ...marker, packetKey: marker.pendingKey };
                         }
                     }
-                    await live(meta.destination, item.event, item.payload);
+                    const liveDelivered = await live(meta.destination, item.event, item.payload);
+                    if (meta.type === 'MESSAGE' && !liveDelivered) {
+                        try { await push(meta.destination); }
+                        catch { log.warn(JSON.stringify({ event: 'fcm_deferred' })); }
+                    }
                     await send(id, 'internet:ack', { accepted: true, stableId: item.stableId }, requestId);
                 } else {
                     const packet = body.packet;

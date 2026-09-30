@@ -39,7 +39,7 @@ export function response(req, b, now) {
 const copy = value => value === undefined ? value : structuredClone(value);
 function conflict() { const e = new Error('conditional'); e.name = 'ConditionalCheckFailedException'; throw e; }
 export class MemoryStore {
-    connections = new Map(); vaccines = new Map(); packets = new Map(); trace = [];
+    connections = new Map(); vaccines = new Map(); packets = new Map(); push = new Map(); trace = [];
     key(node, key) { return `${node}/${key}`; }
     async connection(id) { return copy(this.connections.get(id)); }
     async vaccine(id) { return copy(this.vaccines.get(id)); }
@@ -90,6 +90,12 @@ export class MemoryStore {
         this.packets.set(this.key(gateway, item.packetKey), { ...copy(item), destinationNodeId: gateway });
     }
     async deletePending(node, key) { await this.beforeDelete?.(); this.packets.delete(this.key(node, key)); }
+    async registerPushToken(node, token) {
+        for (const oldToken of await this.pushTokens(node)) if (oldToken !== token) await this.deletePushToken(node, oldToken);
+        this.push.set(this.key(node, token), token);
+    }
+    async pushTokens(node) { return [...this.push.entries()].filter(([key]) => key.startsWith(`${node}/`)).map(([, token]) => token); }
+    async deletePushToken(node, token) { this.push.delete(this.key(node, token)); }
     async saveControl(item, markerKey) {
         await this.beforeSaveControl?.();
         const key = this.key(item.destinationNodeId, markerKey);
@@ -108,9 +114,10 @@ export class MemoryStore {
 export function setup() {
     const store = new MemoryStore();
     const events = [];
+    const pushes = [];
     let clock = 1_800_000_000_000;
     const gone = new Set();
-    const handler = createHandler({ store, now: () => clock, log: { warn() {} },
+    const handler = createHandler({ store, now: () => clock, log: { warn() {} }, push: async node => { pushes.push(node); },
         transport: () => async (id, envelope) => {
             if (gone.has(id)) { const e = new Error(); e.name = 'GoneException'; throw e; }
             store.trace.push('post'); events.push({ id, ...copy(envelope) });
@@ -126,6 +133,6 @@ export function setup() {
         await call(id, 'authProof', { challengeId: challenge.challengeId,
             signature: signed(authBytes(who.nodeId, challenge.challengeId, challenge.challenge), who) });
     }
-    return { store, events, handler, call, auth, gone, now: () => clock, advance: delta => { clock += delta; },
+    return { store, events, pushes, handler, call, auth, gone, now: () => clock, advance: delta => { clock += delta; },
         error: () => events.filter(e => e.event === 'internet:error').at(-1)?.data.error };
 }
