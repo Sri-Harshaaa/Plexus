@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "com.plexus.app",
+      "sha256_cert_fingerprints": [
+        "B0:E7:9B:54:C3:6D:1C:D9:B6:B3:00:43:A1:28:A0:DC:15:9D:E2:70:96:0E:0D:53:C3:66:00:FB:4A:DF:41:0F"
+      ]
+    }
+  }
+]

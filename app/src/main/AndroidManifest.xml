@@ -178,7 +178,7 @@
 
                 <data
                     android:scheme="https"
-                    android:host="plexus-server.onrender.com"
+                    android:host="plexus-feedb.web.app"
                     android:path="/connect" />
 
             </intent-filter>

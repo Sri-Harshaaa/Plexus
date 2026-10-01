@@ -23,3 +23,8 @@ plexus-server/
 # Firebase local config / generated release artifacts
 /app/google-services.json
 /app/release/
+
+# Firebase CLI / agent generated files
+.firebase/
+.agents/
+skills-lock.json

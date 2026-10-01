@@ -22,7 +22,7 @@ object PlexusDeepLink {
      * domain.
      */
     private const val HOST =
-        "plexus-server.onrender.com"
+        "plexus-feedb.web.app"
 
 
     private const val CONNECT_PATH =
