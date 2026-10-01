@@ -50,7 +50,7 @@ android {
         targetSdk = 37
 
         versionCode = 2
-        versionName = "1.0.0-beta.2"
+        versionName = "2.0"
         buildConfigField("String", "PLEXUS_WEBSOCKET_URL", "\"$plexusWebSocketUrl\"")
 
         testInstrumentationRunner =
