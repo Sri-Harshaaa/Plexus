@@ -102,8 +102,7 @@ internal object PlexusSyncWork {
         if (schedule) {
             // No useful worker is running: replace queued/backoff work, never append a chain.
             WorkManager.getInstance(context).enqueueUniqueWork(UNIQUE_NAME, ExistingWorkPolicy.REPLACE, request)
-            Log.d("PlexusSync", "SYNC_WORK_ENQUEUED")
-        } else Log.d("PlexusSync", "SYNC_WAKE_COALESCED")
+        }
         PlexusPersonalMessaging.wakeForSync()
     }
 
@@ -127,7 +126,6 @@ class PlexusFirebaseMessagingService : FirebaseMessagingService() {
 
     override fun onMessageReceived(message: RemoteMessage) {
         if (message.data["type"] == "plexus_sync") {
-            PlexusDiagnostics.lifecycle("FCM_SYNC_WAKE_RECEIVED")
             PlexusSyncWork.enqueue(applicationContext)
         }
     }
@@ -136,13 +134,9 @@ class PlexusFirebaseMessagingService : FirebaseMessagingService() {
 class PlexusPendingSyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
         val workId = id.toString()
-        val messagesBefore = PlexusDiagnostics.internetMessageCount()
-        PlexusDiagnostics.lifecycle("SYNC_WORK_STARTED workerId=${PlexusDiagnostics.shortId(workId)}")
         if (!PlexusSyncWork.begin(applicationContext, workId)) {
-            PlexusDiagnostics.lifecycle("SYNC_WORK_FINISHED workerId=${PlexusDiagnostics.shortId(workId)} fetched=0 result=SKIPPED")
             return Result.success()
         }
-        var diagnosticResult = "FAILED"
         try {
             while (true) {
                 val generation = PlexusSyncWork.generation(applicationContext)
@@ -155,25 +149,17 @@ class PlexusPendingSyncWorker(context: Context, params: WorkerParameters) : Coro
                     }
                 }
                 if (completed != true) {
-                    Log.d("PlexusSync", if (completed == null) "SYNC_TIMEOUT" else "SYNC_PROOFS_PENDING")
                     if (PlexusSyncWork.failedPass(applicationContext, workId, generation)) continue
-                    Log.d("PlexusSync", "SYNC_WORK_RETRY")
-                    diagnosticResult = "RETRY"
                     return Result.retry()
                 }
                 if (!PlexusSyncWork.finishPass(applicationContext, workId, generation)) {
-                    Log.d("PlexusSync", "SYNC_WORK_SUCCESS")
-                    diagnosticResult = "SUCCESS"
                     return Result.success()
                 }
             }
         } catch (cancelled: CancellationException) {
-            diagnosticResult = "CANCELLED"
-            PlexusDiagnostics.lifecycle("SYNC_WORK_STOPPED workerId=${PlexusDiagnostics.shortId(workId)} stopReason=$stopReason")
             throw cancelled
         } finally {
             PlexusSyncWork.release(applicationContext, workId)
-            PlexusDiagnostics.lifecycle("SYNC_WORK_FINISHED workerId=${PlexusDiagnostics.shortId(workId)} fetched=${PlexusDiagnostics.internetMessageCount() - messagesBefore} result=$diagnosticResult fetchedScope=INTERNET_MESSAGE_INGRESS")
         }
     }
 }

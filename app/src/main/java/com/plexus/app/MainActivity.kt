@@ -2250,8 +2250,6 @@ class MainActivity : ComponentActivity() {
                                                         )
 
 
-                                                PlexusDiagnostics.message("OUTGOING_MESSAGE_CREATED", encryptedPacket.messageId,
-                                                    "destination=${PlexusDiagnostics.shortId(contact.nodeId)}")
 
                                                 val outgoingMessage =
                                                     MessageEntity(

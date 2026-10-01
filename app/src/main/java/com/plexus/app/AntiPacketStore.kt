@@ -59,10 +59,8 @@ class AntiPacketStore(private val database: PlexusDatabase, private val localNod
         packet: NearbyAntiPacket,
         now: Long = System.currentTimeMillis(),
         locallyCreated: Boolean = false
-    ): StoreResult = PlexusDiagnostics.room("AntiPacketStore.store") {
-        val diagnosticTiming = PlexusDiagnostics.begin("PROOF_STORE", "AntiPacketStore.store")
-        try { database.withTransaction {
-        PlexusDiagnostics.room("antiExpiryCleanup") { antiPacketDao.deleteExpiredAntiPackets(now) }
+    ): StoreResult = database.withTransaction {
+        antiPacketDao.deleteExpiredAntiPackets(now)
         val original = database.messageDao().getMessageById(packet.messageId)
         if (original != null && original.isMine &&
             (original.contactNodeId != packet.recipientNodeId || packet.sourceNodeId != localNodeId)) {
@@ -74,14 +72,6 @@ class AntiPacketStore(private val database: PlexusDatabase, private val localNod
             return@withTransaction StoreResult.INVALID
         }
         storeInsideTransaction(packet, now)
-        } } finally { PlexusDiagnostics.end(diagnosticTiming) }
-    }.also { result ->
-        PlexusDiagnostics.message("DELIVERY_PROOF_STORE_RESULT", packet.messageId,
-            "result=${when (result) {
-                StoreResult.STORED -> "STORED"
-                StoreResult.DUPLICATE -> "DUPLICATE"
-                StoreResult.EXPIRED, StoreResult.INVALID -> "REJECTED"
-            }}")
     }
 
     private suspend fun storeInsideTransaction(
@@ -147,10 +137,10 @@ class AntiPacketStore(private val database: PlexusDatabase, private val localNod
          * Remove expired vaccines before considering primary-key
          * conflicts.
          */
-        PlexusDiagnostics.room("antiExpiryCleanup") { antiPacketDao
+        antiPacketDao
             .deleteExpiredAntiPackets(
                 now
-            ) }
+            )
 
 
 
@@ -364,14 +354,12 @@ class AntiPacketStore(private val database: PlexusDatabase, private val localNod
         now: Long =
             System.currentTimeMillis()
     ): Boolean {
-        val diagnosticTiming = PlexusDiagnostics.begin("ROOM", "hasActiveVaccineFor", room = true)
-        try {
 
 
-        PlexusDiagnostics.room("antiExpiryCleanup") { antiPacketDao
+        antiPacketDao
             .deleteExpiredAntiPackets(
                 now
-            ) }
+            )
 
 
 
@@ -433,7 +421,6 @@ class AntiPacketStore(private val database: PlexusDatabase, private val localNod
 
         return true
 
-        } finally { PlexusDiagnostics.end(diagnosticTiming) }
     }
 
 
@@ -453,10 +440,10 @@ class AntiPacketStore(private val database: PlexusDatabase, private val localNod
     ): List<NearbyAntiPacket> {
 
 
-        PlexusDiagnostics.room("antiExpiryCleanup") { antiPacketDao
+        antiPacketDao
             .deleteExpiredAntiPackets(
                 now
-            ) }
+            )
 
 
 
@@ -490,10 +477,10 @@ class AntiPacketStore(private val database: PlexusDatabase, private val localNod
     ): Int {
 
 
-        return PlexusDiagnostics.room("antiExpiryCleanup") { antiPacketDao
+        return antiPacketDao
             .deleteExpiredAntiPackets(
                 now
-            ) }
+            )
     }
 
 
@@ -510,10 +497,10 @@ class AntiPacketStore(private val database: PlexusDatabase, private val localNod
     ): Int {
 
 
-        PlexusDiagnostics.room("antiExpiryCleanup") { antiPacketDao
+        antiPacketDao
             .deleteExpiredAntiPackets(
                 now
-            ) }
+            )
 
 
         return antiPacketDao

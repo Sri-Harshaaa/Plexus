@@ -735,27 +735,3 @@ test('late concurrent post cannot roll back a newer durable message checkpoint',
     const next = await s.store.claimSyncPage(b.nodeId, true, s.now(), async () => true);
     assert.equal(next.items[0].stableId, pending[2].packetId);
 });
-
-test('diagnostic lifecycle correlates authenticated message persistence, sync and ACK without raw identity or packet data', async () => {
-    const { createHash } = await import('node:crypto');
-    const short = v => createHash('sha256').update(v).digest('hex').slice(0, 12);
-    const s = setup(), a = identity(), b = identity(); await s.auth('sender-private-connection', a);
-    const p = message(a, b, s.now());
-    await s.call('sender-private-connection', 'sendPacket', { packet: p });
-    await s.auth('recipient-private-connection', b);
-    const events = s.diagnostics.filter(d => d.id === short(p.packetId)).map(d => d.event);
-    for (const expected of ['SEND_PACKET_VALIDATED', 'MESSAGE_PERSIST_BEGIN', 'PENDING_MESSAGE_STORED',
-        'LIVE_FORWARD_RESULT', 'FCM_WAKE_ATTEMPT', 'SEND_PACKET_ACK_POSTED', 'SYNC_MESSAGE_SELECTED', 'SYNC_MESSAGE_POST_RESULT']) {
-        assert.ok(events.includes(expected), expected);
-    }
-    for (const expected of ['WS_CONNECTED', 'AUTH_INIT_VALIDATED', 'AUTH_CHALLENGE_POSTED',
-        'AUTH_PROOF_VERIFIED', 'AUTH_SUCCESS_POSTED', 'SYNC_BEGIN', 'MESSAGE_LANE_BEGIN', 'SYNC_COMPLETE_POSTED']) {
-        assert.ok(s.diagnostics.some(d => d.event === expected), expected);
-    }
-    const logs = JSON.stringify(s.diagnostics);
-    for (const raw of [p.packetId, a.nodeId, b.nodeId, a.signingPublicKey, b.signingPublicKey,
-        p.originSignature, p.encryptedPayload, 'sender-private-connection', 'recipient-private-connection']) {
-        assert.equal(logs.includes(raw), false);
-    }
-    assert.ok(s.diagnostics.every(d => d.connection.match(/^[a-f0-9]{12}$/)));
-});

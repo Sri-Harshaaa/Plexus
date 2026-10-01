@@ -123,8 +123,11 @@ class InternetSessionTest {
     @Test fun mismatchedProofMessageAckCannotPublishOrClearTheProof() = scenario { session, clock, peer, _, events ->
         peer.acknowledge = false
         assertTrue(session.offer("proof:new", "deliveryProof", JSONObject().put("messageId", "new"), clock.now + 100000))
-        clock.await { events.contains("proofDispatch:new") }
-        peer.ack(peer.received.last().getString("requestId"), "wrong-message")
+        clock.await {
+            events.contains("proofDispatch:new") &&
+                peer.received.any { it.optString("action") == "deliveryProof" }
+        }
+        peer.ack(peer.received.last { it.optString("action") == "deliveryProof" }.getString("requestId"), "wrong-message")
         clock.await { events.contains("disconnected") }
         assertFalse(events.any { it.startsWith("proofAck:") })
     }

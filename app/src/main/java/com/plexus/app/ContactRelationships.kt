@@ -109,16 +109,12 @@ internal class ContactRelationships(private val database: PlexusDatabase) {
     }
 
     /** null means suppressed, false means an already persisted valid copy. */
-    suspend fun persistIncoming(message: MessageEntity): Boolean? = PlexusDiagnostics.room("persistIncoming") { database.withTransaction {
+    suspend fun persistIncoming(message: MessageEntity): Boolean? = database.withTransaction {
         if (message.isMine || !ContactRelationshipState.canReceiveMessages(contacts.getContactById(message.contactNodeId)?.relationshipState)) null
         else {
             val inserted = database.messageDao().insertMessage(message) != -1L
             if (inserted) database.conversationStateDao().unhideConversation(message.contactNodeId)
             inserted
         }
-    }
-    }.also { inserted ->
-        if (inserted != null) PlexusDiagnostics.message("RECEIVER_MESSAGE_PERSISTED", message.messageId,
-            "inserted=${if (inserted) "true" else "duplicate"}")
     }
 }

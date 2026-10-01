@@ -49,7 +49,7 @@ internal class PlexusTransportRuntime(
     private val proofPublicationOutbox by lazy {
         ProofPublicationOutbox(antiPacketDao, identity.nodeId,
             CoroutineScope(coroutineScope.coroutineContext + Dispatchers.Main.immediate)) { proof, background ->
-            PlexusDiagnostics.proofOffer("INTERNET") { internetManager.sendAntiPacket(proof, background) }
+            internetManager.sendAntiPacket(proof, background)
         }
     }
     private val internetIngressJobs = mutableSetOf<Job>()
@@ -346,7 +346,6 @@ internal class PlexusTransportRuntime(
 
                                                         if (!networkParticipationStarted &&
                                                             meshPacket.sourceNodeId != identity.nodeId) continue
-                                                        PlexusDiagnostics.message("PENDING_INTERNET_RETRY", meshPacket.packetId)
 
 
                                                         /*
@@ -362,7 +361,7 @@ internal class PlexusTransportRuntime(
                                                             antiPacketStore
                                                                 .hasActiveVaccineFor(
                                                                     meshPacket
-                                                                ).also { found -> PlexusDiagnostics.message("VACCINE_FOUND_FOR_PENDING", meshPacket.packetId, "found=$found") }
+                                                                )
                                                         ) {
 
                                                             meshRelayStore
@@ -648,7 +647,6 @@ internal class PlexusTransportRuntime(
                                             coroutineScope.launch(Dispatchers.Main.immediate) {
                                                 ingress.forEach { it.join() }
                                                 val published = if (callbacks.isEmpty()) true else proofPublicationOutbox.flush()
-                                                Log.d("PlexusSync", "PENDING_SYNC_COMPLETE proofsPublished=$published")
                                                 callbacks.forEach { (id, callback) ->
                                                     if (pendingSyncCallbacks.remove(id) != null) callback(published)
                                                 }
@@ -695,7 +693,6 @@ internal class PlexusTransportRuntime(
                                         override fun onMeshPacketReceived(
                                             packet: NearbyMeshPacket
                                         ) {
-                                            Log.d("PlexusSync", "PENDING_MESSAGE_RECEIVED")
 
 
                                             if (
@@ -922,7 +919,7 @@ internal class PlexusTransportRuntime(
                                                             ?: try {
 
 
-                                                                PlexusDiagnostics.timed("KEY_DERIVATION", "sessionKey") { PlexusCrypto
+                                                                PlexusCrypto
                                                                     .deriveSessionKey(
 
                                                                         localAgreementPublicKey =
@@ -938,7 +935,7 @@ internal class PlexusTransportRuntime(
 
                                                                         remoteNodeId =
                                                                             knownContact.nodeId
-                                                                    ) }
+                                                                    )
                                                                     .also { derivedKey ->
 
                                                                         peerEncryptionKeys[
@@ -966,11 +963,11 @@ internal class PlexusTransportRuntime(
 
 
                                                     val plaintext =
-                                                        PlexusDiagnostics.timed("DECRYPT", "encryptedChat") { encryptedPacket
+                                                        encryptedPacket
                                                             .decrypt(
                                                                 sessionKey =
                                                                     sessionKey
-                                                            ) }
+                                                            )
 
 
                                                     if (
@@ -1099,7 +1096,7 @@ internal class PlexusTransportRuntime(
 
                                                                     recipientIdentity =
                                                                         identity
-                                                                ).also { PlexusDiagnostics.message("DELIVERY_PROOF_GENERATED", it.messageId) }
+                                                                )
 
 
                                                         } catch (
@@ -1149,9 +1146,9 @@ internal class PlexusTransportRuntime(
 
 
                                                                 if (networkParticipationStarted) {
-                                                                    PlexusDiagnostics.proofOffer("NEARBY", deliveryAntiPacket.messageId) { nearbyManagerHolder[0]?.broadcastBytes(
+                                                                    nearbyManagerHolder[0]?.broadcastBytes(
                                                                         deliveryAntiPacket.toBytes()
-                                                                    ) }
+                                                                    )
                                                                 }
 
 
@@ -1246,11 +1243,11 @@ internal class PlexusTransportRuntime(
                                                             nearbyManagerHolder[0]?.discardAcknowledged(packet)
 
 
-                                                            PlexusDiagnostics.room("markMessageDelivered") { messageDao
+                                                            messageDao
                                                                 .markMessageDelivered(
                                                                     packet.messageId,
                                                                     packet.recipientNodeId
-                                                                ).also { rows -> PlexusDiagnostics.message("MARK_MESSAGE_DELIVERED", packet.messageId, "rowsUpdated=$rows") } }
+                                                                )
 
 
                                                             /*
@@ -1261,7 +1258,7 @@ internal class PlexusTransportRuntime(
                                                          * rebroadcast when they come back.
                                                          */
                                                             if (networkParticipationStarted) {
-                                                                PlexusDiagnostics.proofOffer("NEARBY", packet.messageId) { nearbyManagerHolder[0]?.broadcastBytes(packet.toBytes()) }
+                                                                nearbyManagerHolder[0]?.broadcastBytes(packet.toBytes())
                                                             }
 
 
@@ -1279,11 +1276,11 @@ internal class PlexusTransportRuntime(
                                                             nearbyManagerHolder[0]?.discardAcknowledged(packet)
 
 
-                                                            PlexusDiagnostics.room("markMessageDelivered") { messageDao
+                                                            messageDao
                                                                 .markMessageDelivered(
                                                                     packet.messageId,
                                                                     packet.recipientNodeId
-                                                                ).also { rows -> PlexusDiagnostics.message("MARK_MESSAGE_DELIVERED", packet.messageId, "rowsUpdated=$rows") } }
+                                                                )
 
 
                                                             Log.d(
@@ -1624,10 +1621,10 @@ internal class PlexusTransportRuntime(
                                          * sender's node/key binding, signature and lifetime.
                                          */
                                             val connectionRequestPacket =
-                                                PlexusDiagnostics.timed("PARSE", "ConnectionRequestPacket") { ConnectionRequestPacket
+                                                ConnectionRequestPacket
                                                     .fromBytes(
                                                         bytes
-                                                    ) }
+                                                    )
 
 
                                             if (
@@ -1644,7 +1641,7 @@ internal class PlexusTransportRuntime(
                                                 }
 
 
-                                                PlexusDiagnostics.launch(coroutineScope) {
+                                                coroutineScope.launch(Dispatchers.Main.immediate) {
 
                                                     handleIncomingConnectionRequest(
                                                         connectionRequestPacket,
@@ -1663,10 +1660,10 @@ internal class PlexusTransportRuntime(
                                          * =================================================
                                          */
                                             val connectionResponsePacket =
-                                                PlexusDiagnostics.timed("PARSE", "ConnectionResponsePacket") { ConnectionResponsePacket
+                                                ConnectionResponsePacket
                                                     .fromBytes(
                                                         bytes
-                                                    ) }
+                                                    )
 
 
                                             if (
@@ -1683,7 +1680,7 @@ internal class PlexusTransportRuntime(
                                                 }
 
 
-                                                PlexusDiagnostics.launch(coroutineScope) {
+                                                coroutineScope.launch(Dispatchers.Main.immediate) {
 
                                                     handleIncomingConnectionResponse(
                                                         connectionResponsePacket,
@@ -1711,10 +1708,10 @@ internal class PlexusTransportRuntime(
                                          */
 
                                             val identityPacket =
-                                                PlexusDiagnostics.timed("PARSE", "NearbyIdentityPacket") { NearbyIdentityPacket
+                                                NearbyIdentityPacket
                                                     .fromBytes(
                                                         bytes
-                                                    ) }
+                                                    )
 
 
                                             if (
@@ -1916,10 +1913,10 @@ internal class PlexusTransportRuntime(
                                          */
 
                                             val authPacket =
-                                                PlexusDiagnostics.timed("PARSE", "NearbyAuthPacket") { NearbyAuthPacket
+                                                NearbyAuthPacket
                                                     .fromBytes(
                                                         bytes
-                                                    ) }
+                                                    )
 
 
                                             if (
@@ -2188,7 +2185,7 @@ internal class PlexusTransportRuntime(
 
 
                                                                     val sessionKey =
-                                                                        PlexusDiagnostics.timed("KEY_DERIVATION", "sessionKey") { PlexusCrypto
+                                                                        PlexusCrypto
                                                                             .deriveSessionKey(
 
                                                                                 localAgreementPublicKey =
@@ -2204,7 +2201,7 @@ internal class PlexusTransportRuntime(
 
                                                                                 remoteNodeId =
                                                                                     knownContact.nodeId
-                                                                            ) }
+                                                                            )
 
 
                                                                     peerEncryptionKeys[
@@ -2271,7 +2268,7 @@ internal class PlexusTransportRuntime(
                                                          * will handle deletion in the next
                                                          * protocol stage.
                                                          */
-                                                            PlexusDiagnostics.launch(coroutineScope) {
+                                                            coroutineScope.launch(Dispatchers.Main.immediate) {
 
 
                                                                 try {
@@ -2522,16 +2519,15 @@ internal class PlexusTransportRuntime(
                                          */
 
                                             val antiPacket =
-                                                PlexusDiagnostics.timed("PARSE", "NearbyAntiPacket") { NearbyAntiPacket
+                                                NearbyAntiPacket
                                                     .fromBytes(
                                                         bytes
-                                                    ) }
+                                                    )
 
 
                                             if (
                                                 antiPacket != null
                                             ) {
-                                                PlexusDiagnostics.message("DELIVERY_PROOF_RECEIVED", antiPacket.messageId, "source=NEARBY")
 
 
                                                 val manager =
@@ -2581,7 +2577,7 @@ internal class PlexusTransportRuntime(
                                                 }
 
 
-                                                PlexusDiagnostics.launch(coroutineScope) {
+                                                coroutineScope.launch(Dispatchers.Main.immediate) {
 
 
                                                     try {
@@ -2601,11 +2597,11 @@ internal class PlexusTransportRuntime(
                                                                 nearbyManagerHolder[0]?.discardAcknowledged(antiPacket)
 
 
-                                                                PlexusDiagnostics.room("markMessageDelivered") { messageDao
+                                                                messageDao
                                                                     .markMessageDelivered(
                                                                         antiPacket.messageId,
                                                                         antiPacket.recipientNodeId
-                                                                    ).also { rows -> PlexusDiagnostics.message("MARK_MESSAGE_DELIVERED", antiPacket.messageId, "rowsUpdated=$rows") } }
+                                                                    )
 
 
                                                                 Log.d(
@@ -2625,11 +2621,11 @@ internal class PlexusTransportRuntime(
                                                              * are not rebroadcast, preventing a
                                                              * vaccine loop.
                                                              */
-                                                                PlexusDiagnostics.proofOffer("NEARBY", antiPacket.messageId) { manager
+                                                                manager
                                                                     .broadcastBytes(
                                                                         antiPacket
                                                                             .toBytes()
-                                                                    ) }
+                                                                    )
                                                             }
 
 
@@ -2639,11 +2635,11 @@ internal class PlexusTransportRuntime(
                                                                 nearbyManagerHolder[0]?.discardAcknowledged(antiPacket)
 
 
-                                                                PlexusDiagnostics.room("markMessageDelivered") { messageDao
+                                                                messageDao
                                                                     .markMessageDelivered(
                                                                         antiPacket.messageId,
                                                                         antiPacket.recipientNodeId
-                                                                    ).also { rows -> PlexusDiagnostics.message("MARK_MESSAGE_DELIVERED", antiPacket.messageId, "rowsUpdated=$rows") } }
+                                                                    )
 
 
                                                                 Log.d(
@@ -2716,16 +2712,15 @@ internal class PlexusTransportRuntime(
                                          */
 
                                             val meshPacket =
-                                                PlexusDiagnostics.timed("PARSE", "NearbyMeshPacket") { NearbyMeshPacket
+                                                NearbyMeshPacket
                                                     .fromBytes(
                                                         bytes
-                                                    ) }
+                                                    )
 
 
                                             if (
                                                 meshPacket != null
                                             ) {
-                                                PlexusDiagnostics.message("RECEIVER_PACKET_INGRESS", meshPacket.packetId, "source=NEARBY")
 
 
                                                 val manager =
@@ -2780,7 +2775,7 @@ internal class PlexusTransportRuntime(
                                                 ) {
 
 
-                                                    PlexusDiagnostics.launch(coroutineScope) {
+                                                    coroutineScope.launch(Dispatchers.Main.immediate) {
 
                                                         meshRelayStore
                                                             .cleanupExpired()
@@ -2806,7 +2801,7 @@ internal class PlexusTransportRuntime(
                                              * this coroutine instead of blocking Nearby's
                                              * callback thread.
                                              */
-                                                PlexusDiagnostics.launch(coroutineScope) {
+                                                coroutineScope.launch(Dispatchers.Main.immediate) {
 
 
                                                     try {
@@ -2835,8 +2830,8 @@ internal class PlexusTransportRuntime(
                                                             antiPacketDao.getAntiPacket(meshPacket.packetId)
                                                                 ?.toNearbyAntiPacket()
                                                                 ?.let { proof ->
-                                                                    PlexusDiagnostics.proofOffer("NEARBY", proof.messageId) { manager.sendBytesToNode(immediatePeerNodeId, proof.toBytes(),
-                                                                        NearbyManager.SendPriority.MESSAGE) }
+                                                                    manager.sendBytesToNode(immediatePeerNodeId, proof.toBytes(),
+                                                                        NearbyManager.SendPriority.MESSAGE)
                                                                 }
                                                             Log.d(
                                                                 "PlexusNearby",
@@ -3005,7 +3000,7 @@ internal class PlexusTransportRuntime(
                                                                     ?: try {
 
 
-                                                                        PlexusDiagnostics.timed("KEY_DERIVATION", "sessionKey") { PlexusCrypto
+                                                                        PlexusCrypto
                                                                             .deriveSessionKey(
 
                                                                                 localAgreementPublicKey =
@@ -3021,7 +3016,7 @@ internal class PlexusTransportRuntime(
 
                                                                                 remoteNodeId =
                                                                                     knownContact.nodeId
-                                                                            ) }
+                                                                            )
                                                                             .also { derivedKey ->
 
                                                                                 peerEncryptionKeys[
@@ -3049,11 +3044,11 @@ internal class PlexusTransportRuntime(
 
 
                                                             val plaintext =
-                                                                PlexusDiagnostics.timed("DECRYPT", "encryptedChat") { encryptedPacket
+                                                                encryptedPacket
                                                                     .decrypt(
                                                                         sessionKey =
                                                                             sessionKey
-                                                                    ) }
+                                                                    )
 
 
                                                             if (
@@ -3193,7 +3188,7 @@ internal class PlexusTransportRuntime(
 
                                                                             recipientIdentity =
                                                                                 identity
-                                                                        ).also { PlexusDiagnostics.message("DELIVERY_PROOF_GENERATED", it.messageId) }
+                                                                        )
 
 
                                                                 } catch (
@@ -3240,12 +3235,12 @@ internal class PlexusTransportRuntime(
                                                                      * will drop the duplicate and
                                                                      * will not rebroadcast it.
                                                                      */
-                                                                        PlexusDiagnostics.proofOffer("NEARBY", deliveryAntiPacket.messageId) { manager
+                                                                        manager
                                                                             .broadcastBytes(
                                                                                 bytes = deliveryAntiPacket
                                                                                     .toBytes(),
                                                                                 priority = NearbyManager.SendPriority.MESSAGE
-                                                                            ) }
+                                                                            )
 
 
                                                                         /*
@@ -3467,7 +3462,6 @@ internal class PlexusTransportRuntime(
 
     fun startPersonalMessaging(onStarted: () -> Unit, onFailed: (Throwable) -> Unit) {
         requireMainThread()
-        PlexusDiagnostics.printBuildOnce()
         if (started || stopping) return
         started = true
         coroutineScope.launch(Dispatchers.Main.immediate) {
@@ -3518,7 +3512,7 @@ internal class PlexusTransportRuntime(
     }
 
     private fun launchInternetIngress(block: suspend CoroutineScope.() -> Unit) {
-        val job = PlexusDiagnostics.launch(coroutineScope, source = "INTERNET", block = block)
+        val job = coroutineScope.launch(Dispatchers.Main.immediate, block = block)
         internetIngressJobs.add(job)
         job.invokeOnCompletion { internetIngressJobs.remove(job) }
     }
@@ -3596,7 +3590,6 @@ internal class PlexusTransportRuntime(
         requireMainThread()
         if (!initialized || stopping || networkParticipationStarted) return
         networkParticipationStarted = true
-        PlexusDiagnostics.start(coroutineScope) { nearbyManager.diagnosticSnapshot() }
         startNearbyIfPermitted()
         nearbyRetryJob = coroutineScope.launch(Dispatchers.Main.immediate) {
             while (true) {
@@ -3616,7 +3609,6 @@ internal class PlexusTransportRuntime(
         requireMainThread()
         if (!networkParticipationStarted) return
         networkParticipationStarted = false
-        PlexusDiagnostics.stop()
         internetManager.stopGatewayOffers()
         nearbyRetryJob?.cancel()
         nearbyRetryJob = null
@@ -3639,7 +3631,6 @@ internal class PlexusTransportRuntime(
         requireMainThread()
         if (!initialized || stopping) return
         pendingSyncCallbacks[requestId] = onComplete
-        Log.d("PlexusSync", "PENDING_SYNC_REQUESTED")
         internetManager.wakeForSync()
         internetManager.retryPending()
     }
@@ -3678,7 +3669,6 @@ internal class PlexusTransportRuntime(
         requireMainThread()
         if (stopping) return
         stopping = true
-        PlexusDiagnostics.stop()
         initialized = false
         networkParticipationStarted = false
         internetSyncJob[0]?.cancel()

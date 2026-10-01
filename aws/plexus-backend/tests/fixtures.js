@@ -151,10 +151,9 @@ export function setup({ pushFailure = false } = {}) {
     const store = new MemoryStore();
     const events = [];
     const pushes = [];
-    const diagnostics = [];
     let clock = 1_800_000_000_000;
     const gone = new Set();
-    const handler = createHandler({ store, now: () => clock, log: { warn() {}, info(record) { diagnostics.push(JSON.parse(record)); } }, push: async node => { pushes.push(node); if (pushFailure) throw new Error('push unavailable'); },
+    const handler = createHandler({ store, now: () => clock, log: { warn() {} }, push: async node => { pushes.push(node); if (pushFailure) throw new Error('push unavailable'); },
         transport: () => async (id, envelope) => {
             if (gone.has(id)) { const e = new Error(); e.name = 'GoneException'; throw e; }
             store.trace.push('post'); events.push({ id, ...copy(envelope) });
@@ -171,6 +170,6 @@ export function setup({ pushFailure = false } = {}) {
         await call(id, 'authProof', { challengeId: challenge.challengeId,
             signature: signed(authBytes(who.nodeId, challenge.challengeId, challenge.challenge), who) });
     }
-    return { store, events, pushes, diagnostics, handler, call, auth, gone, now: () => clock, advance: delta => { clock += delta; },
+    return { store, events, pushes, handler, call, auth, gone, now: () => clock, advance: delta => { clock += delta; },
         error: () => events.filter(e => e.event === 'internet:error').at(-1)?.data.error };
 }

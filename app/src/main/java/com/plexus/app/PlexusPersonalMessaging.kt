@@ -34,7 +34,6 @@ internal object PlexusPersonalMessaging {
 
     @Suppress("DEPRECATION")
     fun start(context: Context, onStarted: (() -> Unit)? = null, onFailed: ((Throwable) -> Unit)? = null) {
-        Log.d("PlexusSync", "PERSONAL_RUNTIME_START_REQUESTED")
         main.post {
             if (starting) {
                 onStarted?.let(startCallbacks::add)
@@ -43,7 +42,6 @@ internal object PlexusPersonalMessaging {
             }
             val current = runtime
             if (isPersonalMessagingReady(starting, current != null)) {
-                Log.d("PlexusSync", "PERSONAL_RUNTIME_READY")
                 onStarted?.invoke()
                 return@post
             }
@@ -67,7 +65,6 @@ internal object PlexusPersonalMessaging {
             runtime = created
             created.startPersonalMessaging(
                 onStarted = {
-                    Log.d("PlexusSync", "PERSONAL_RUNTIME_READY")
                     starting = false
                     startFailureCallbacks.clear()
                     FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->

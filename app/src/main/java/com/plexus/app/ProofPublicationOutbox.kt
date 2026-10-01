@@ -1,5 +1,6 @@
 package com.plexus.app
 
+import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
@@ -40,7 +41,6 @@ internal class ProofPublicationOutbox(
                     // oldest-first window, without a historical vaccine scan or paced delays.
                     for (row in live.take(RECOVERY_WINDOW)) {
                         if (row.messageId in submitted) continue
-                        PlexusDiagnostics.message("PROOF_NET_PENDING", row.messageId)
                         if (!offer(row.toNearbyAntiPacket(), true)) break
                         submitted.add(row.messageId)
                     }
@@ -50,7 +50,6 @@ internal class ProofPublicationOutbox(
 
     fun disconnected() {
         authenticated.value = false
-        submitted.forEach { PlexusDiagnostics.message("PROOF_NET_RETRY", it) }
         submitted.clear()
     }
 
@@ -65,22 +64,20 @@ internal class ProofPublicationOutbox(
         if (row.recipientNodeId != localNodeId || row.internetPublishedAt != null ||
             row.expiresAt <= System.currentTimeMillis()) return
         // Always offer the persisted representation, including after a duplicate signing race.
-        PlexusDiagnostics.message("PROOF_NET_PENDING", row.messageId)
         if (authenticated.value && offer(row.toNearbyAntiPacket(), false)) submitted.add(row.messageId)
     }
 
     suspend fun acknowledge(packet: NearbyAntiPacket) {
         if (packet.recipientNodeId != localNodeId) return
         try {
-            val updated = dao.markInternetPublished(packet.messageId, packet.sourceNodeId,
+            dao.markInternetPublished(packet.messageId, packet.sourceNodeId,
                 packet.recipientNodeId, packet.signature, packet.deliveredAt, packet.expiresAt,
                 System.currentTimeMillis())
-            if (updated > 0) PlexusDiagnostics.message("PROOF_NET_ACKED", packet.messageId)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
             // An ACK that could not be committed leaves a durable retry obligation.
-            PlexusDiagnostics.lifecycle("PROOF_NET_ACK_COMMIT_FAILED")
+            Log.w("PlexusInternet", "Delivery proof ACK could not be committed; retained for retry")
         }
     }
 
@@ -93,9 +90,6 @@ internal class ProofPublicationOutbox(
             }.first { (pending, online) -> !pending || !online }
         }
         val complete = result != null && !result.first
-        if (!complete) submitted.take(RECOVERY_WINDOW).forEach {
-            PlexusDiagnostics.message("PROOF_NET_RETRY", it)
-        }
         return complete
     }
     companion object { private const val RECOVERY_WINDOW = 16 }

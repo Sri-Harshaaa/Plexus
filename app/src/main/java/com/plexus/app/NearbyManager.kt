@@ -314,7 +314,6 @@ class NearbyManager(
 
 
     private val outboxes = mutableMapOf<String, EndpointOutbox>()
-    private val diagnosticTransferStarts = mutableMapOf<String, Long>()
     private val transferWatchdogs = mutableMapOf<String, Runnable>()
     private val connectionWatchdogs = mutableMapOf<String, Runnable>()
     private var nextConnectionSession = 0L
@@ -399,25 +398,20 @@ class NearbyManager(
                 endpointId: String,
                 payload: Payload
             ) {
-                val diagnostic = PlexusDiagnostics.callbackEnter(endpointId, payload.id, session)
                 if (Looper.myLooper() != Looper.getMainLooper()) {
-                    PlexusDiagnostics.callbackResult(diagnostic, "RX_CALLBACK_POSTED_MAIN")
-                    if (!recoveryHandler.post { receivePayload(endpointId, payload, session, diagnostic) }) {
-                        PlexusDiagnostics.callbackResult(diagnostic, "RX_CALLBACK_REJECTED_MAIN_POST")
+                    if (!recoveryHandler.post { receivePayload(endpointId, payload, session) }) {
+                        Log.w(TAG, "Nearby payload could not be posted to Main")
                     }
                     return
                 }
-                receivePayload(endpointId, payload, session, diagnostic)
+                receivePayload(endpointId, payload, session)
             }
 
-            private fun receivePayload(endpointId: String, payload: Payload, session: Long,
-                diagnostic: PlexusDiagnostics.Ingress?) {
+            private fun receivePayload(endpointId: String, payload: Payload, session: Long) {
                 if (connectionSessions[endpointId] != session) {
-                    PlexusDiagnostics.callbackResult(diagnostic, "RX_CALLBACK_STALE_SESSION")
                     return
                 }
                 if (endpointId !in connectedEndpoints) {
-                    PlexusDiagnostics.callbackResult(diagnostic, "RX_CALLBACK_ENDPOINT_MISSING")
                     return
                 }
                 when (
@@ -430,7 +424,7 @@ class NearbyManager(
 
                         val bytes =
                             try { payload.asBytes() } catch (failure: Throwable) {
-                                PlexusDiagnostics.callbackResult(diagnostic, "RX_CALLBACK_REJECTED_READ_EXCEPTION")
+                                Log.e(TAG, "Nearby payload read failed")
                                 throw failure
                             }
 
@@ -438,8 +432,6 @@ class NearbyManager(
                         if (
                             bytes == null || bytes.size > EndpointOutbox.MAX_BYTES
                         ) {
-                            PlexusDiagnostics.callbackResult(diagnostic,
-                                if (bytes == null) "RX_CALLBACK_REJECTED_NULL_BYTES" else "RX_CALLBACK_REJECTED_SIZE")
 
 
                             Log.d(
@@ -465,27 +457,22 @@ class NearbyManager(
                         budget.tokens = minOf(128.0, budget.tokens + (now - budget.updatedAt) / 50.0)
                         budget.updatedAt = now
                         if (budget.tokens < 1.0) {
-                            PlexusDiagnostics.callbackResult(diagnostic, "RX_CALLBACK_REJECTED_RATE_LIMIT")
                             return
                         }
                         budget.tokens -= 1.0
                         try {
-                            PlexusDiagnostics.ingress(diagnostic) {
-                                listener.onBytesReceived(
-                                    endpointId = endpointId,
-                                    bytes = bytes
-                                )
-                            }
+                            listener.onBytesReceived(
+                                endpointId = endpointId,
+                                bytes = bytes
+                            )
                         } catch (failure: Throwable) {
-                            PlexusDiagnostics.callbackResult(diagnostic, "RX_CALLBACK_REJECTED_LISTENER_EXCEPTION")
+                            Log.e(TAG, "Nearby payload listener failed")
                             throw failure
                         }
-                        PlexusDiagnostics.callbackResult(diagnostic, "RX_CALLBACK_ACCEPTED")
                     }
 
 
                     else -> {
-                        PlexusDiagnostics.callbackResult(diagnostic, "RX_CALLBACK_UNSUPPORTED")
 
 
                         Log.d(
@@ -503,9 +490,6 @@ class NearbyManager(
                 endpointId: String,
                 update: PayloadTransferUpdate
             ) {
-                if (update.status != PayloadTransferUpdate.Status.IN_PROGRESS) {
-                    PlexusDiagnostics.outbox("TRANSFER_CALLBACK", "endpoint=${endpointId.take(8)} session=$session payload=${update.payloadId} status=${update.status} thread=${Thread.currentThread().name.take(32)}")
-                }
                 if (Looper.myLooper() != Looper.getMainLooper()) {
                     recoveryHandler.post { onPayloadTransferUpdate(endpointId, update) }
                     return
@@ -514,22 +498,17 @@ class NearbyManager(
 
 
                 if (connectionSessions[endpointId] != session) {
-                    diagnosticOutbox("CALLBACK_STALE_SESSION", "endpoint=${endpointId.take(8)} session=$session payload=${update.payloadId}")
                     return
                 }
                 val box = outboxes[endpointId] ?: run {
-                    diagnosticOutbox("CALLBACK_NO_BOX", "endpoint=${endpointId.take(8)} payload=${update.payloadId}")
                     return
                 }
                 val transfer = box.inFlight ?: run {
-                    diagnosticOutbox("CALLBACK_NO_IN_FLIGHT", diagnosticQueue(endpointId, box).render())
                     return
                 }
                 if (transfer.payloadId != update.payloadId) {
-                    diagnosticOutbox("CALLBACK_OTHER_PAYLOAD", "payload=${update.payloadId} ${diagnosticQueue(endpointId, box).render()}")
                     return
                 }
-                diagnosticOutbox("CALLBACK_MATCHED", "status=${update.status} ${diagnosticQueue(endpointId, box).render()}")
 
                 when (
                     update.status
@@ -2245,7 +2224,6 @@ class NearbyManager(
         verifiedEndpoints.add(
             endpointId
         )
-        PlexusDiagnostics.updateNearbyState(diagnosticSnapshot())
 
         val candidate = attemptCandidates[endpointId]
         if (candidate != null) {
@@ -2504,7 +2482,6 @@ class NearbyManager(
         priority: SendPriority
     ): Boolean {
         check(Looper.myLooper() == Looper.getMainLooper())
-        diagnosticOutbox("OFFER_ENTER", "endpoint=${endpointId.take(8)} offeredPriority=${priority.rank}")
         if (bytes.isEmpty() || bytes.size > EndpointOutbox.MAX_BYTES) return false
         if (!connectedEndpoints.contains(endpointId)) return false
         val box = outboxes[endpointId] ?: return false
@@ -2520,12 +2497,10 @@ class NearbyManager(
         val peerKey = endpointToNodeId[endpointId]?.let { "$it:$key" }
         if (priority == SendPriority.BACKGROUND && key.startsWith("anti:") &&
             peerKey != null && (recentVaccineTransfers[peerKey] ?: Long.MIN_VALUE) > now) {
-            diagnosticOutbox("OFFER_RECENT_SUPPRESSED", diagnosticQueue(endpointId, box).render())
             return true
         }
         val oldSize = box.size
         val accepted = box.offer(key, bytes, priority.rank, SystemClock.elapsedRealtime())
-        diagnosticOutbox("OFFER", "accepted=$accepted offeredPriority=${priority.rank} ${diagnosticQueue(endpointId, box).render()}")
         if (!accepted) {
             Log.w(TAG, "OUTBOUND BACKPRESSURE -> $endpointId | priority=$priority | queued=${box.size} | durable retry retained")
             return false
@@ -2536,19 +2511,14 @@ class NearbyManager(
     }
 
     private fun drainOutboundQueue(endpointId: String) {
-        diagnosticOutbox("DRAIN_ENTER", "endpoint=${endpointId.take(8)}")
         if (!connectedEndpoints.contains(endpointId)) return
         val box = outboxes[endpointId] ?: return
-        diagnosticOutbox("DRAIN", diagnosticQueue(endpointId, box).render())
         val queued = box.poll() ?: return
         val payload = Payload.fromBytes(queued.bytes)
         val transfer = box.start(payload.id, queued)
-        diagnosticTransferStarts[endpointId] = SystemClock.elapsedRealtime()
-        diagnosticOutbox("DISPATCH", diagnosticQueue(endpointId, box).render())
         // Arm before sendPayload: a hung request Task also needs a bounded lifetime.
         val watchdog = Runnable {
             if (outboxes[endpointId] === box && box.matches(transfer)) {
-                diagnosticOutbox("WATCHDOG", diagnosticQueue(endpointId, box).render())
                 Log.w(TAG, "PAYLOAD WATCHDOG TIMEOUT -> $endpointId | payload=${payload.id} | session=${box.session}")
                 failOutgoingPayload(endpointId, transfer, "missing terminal callback")
             }
@@ -2576,8 +2546,6 @@ class NearbyManager(
     private fun finishOutgoingPayload(endpointId: String, transfer: EndpointOutbox.Transfer) {
         val box = outboxes[endpointId] ?: return
         if (!box.finish(transfer, SystemClock.elapsedRealtime())) return
-        diagnosticTransferStarts.remove(endpointId)
-        diagnosticOutbox("FINISHED", diagnosticQueue(endpointId, box).render())
         if (transfer.item.key.startsWith("anti:")) {
             endpointToNodeId[endpointId]?.let { node ->
                 recentVaccineTransfers["$node:${transfer.item.key}"] = SystemClock.elapsedRealtime() + 300_000L
@@ -2592,7 +2560,6 @@ class NearbyManager(
     private fun failOutgoingPayload(endpointId: String, transfer: EndpointOutbox.Transfer, reason: String) {
         val box = outboxes[endpointId] ?: return
         if (!box.matches(transfer)) return
-        diagnosticOutbox("ABORT", diagnosticQueue(endpointId, box).render())
         Log.w(TAG, "PAYLOAD TRANSFER ABORTED -> $endpointId | payload=${transfer.payloadId} | $reason")
         // Invalidate before cancelPayload: Google may deliver cancellation immediately.
         invalidateEndpoint(endpointId, "stale transfer", recoverMedium = true)
@@ -2645,32 +2612,14 @@ class NearbyManager(
     private fun clearOutgoingForEndpoint(endpointId: String) {
         transferWatchdogs.remove(endpointId)?.let(recoveryHandler::removeCallbacks)
         outboxes.remove(endpointId)
-        diagnosticTransferStarts.remove(endpointId)
-    }
-
-    private fun diagnosticOutbox(category: String, detail: String) {
-        PlexusDiagnostics.updateNearbyState(diagnosticSnapshot())
-        PlexusDiagnostics.outbox(category, detail)
-    }
-
-    private fun diagnosticQueue(endpointId: String, box: EndpointOutbox) = PlexusDiagnostics.QueueState(
-        endpointId, box.session, box.diagnosticDepth(0), box.diagnosticDepth(1), box.diagnosticDepth(2),
-        box.inFlight?.payloadId, box.inFlight?.item?.priority, diagnosticTransferStarts[endpointId])
-
-    internal fun diagnosticSnapshot(): PlexusDiagnostics.NearbyState {
-        check(Looper.myLooper() == Looper.getMainLooper())
-        return PlexusDiagnostics.NearbyState(getVerifiedNodeIds().size,
-            outboxes.map { (endpoint, box) -> diagnosticQueue(endpoint, box) })
     }
 
     fun getVerifiedNodeIds(): List<String> =
         nodeIdToEndpoint.filterValues { it in verifiedEndpoints && it in connectedEndpoints }.keys.toList()
 
     fun discardAcknowledged(packet: NearbyAntiPacket) {
-        PlexusDiagnostics.timed("QUEUE_CLEANUP", "discardAcknowledged") {
-            val prefix = "mesh:${packet.sourceNodeId}:${packet.recipientNodeId}:${packet.messageId}:"
-            outboxes.values.forEach { it.discardQueued(prefix) }
-        }
+        val prefix = "mesh:${packet.sourceNodeId}:${packet.recipientNodeId}:${packet.messageId}:"
+        outboxes.values.forEach { it.discardQueued(prefix) }
     }
 
     /*
@@ -2827,7 +2776,6 @@ class NearbyManager(
         connectionWatchdogs.values.forEach(recoveryHandler::removeCallbacks)
         connectionWatchdogs.clear()
         outboxes.clear()
-        diagnosticTransferStarts.clear()
         connectionSessions.clear()
         receiveBudgets.clear()
         recentVaccineTransfers.clear()

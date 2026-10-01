@@ -84,22 +84,19 @@ internal class InternetSession(
         val token = ++generation
         connectingAt = now()
         arm(15_000) { fail(token, "CONNECTION_AUTH_TIMEOUT") }
-        PlexusDiagnostics.lifecycle("WS_CONNECT_START generation=$token")
         try {
             socket = client.newWebSocket(Request.Builder().url(url).build(), object : WebSocketListener() {
                 private fun current(task: () -> Unit) = scheduler.post(Runnable {
                     if (running && generation == token) task()
                 })
                 override fun onOpen(webSocket: WebSocket, response: Response) = current {
-                    PlexusDiagnostics.lifecycle("WS_OPEN generation=$token")
                     socket = webSocket
                     connected = true
                     openedAt = now()
                     lastFrameAt = now()
                     observer.connected()
-                    val sent = write(JSONObject().put("action", "authInit").put("nodeId", nodeId)
+                    write(JSONObject().put("action", "authInit").put("nodeId", nodeId)
                         .put("signingPublicKey", publicKey))
-                    PlexusDiagnostics.lifecycle("AUTH_INIT_SENT generation=$token accepted=$sent")
                 }
                 override fun onMessage(webSocket: WebSocket, text: String) = current {
 
@@ -162,20 +159,17 @@ internal class InternetSession(
         when (event) {
             "auth:challenge" -> {
                 if (authenticated) return
-                PlexusDiagnostics.lifecycle("AUTH_CHALLENGE_RECEIVED generation=$generation")
                 val id = data.getString("challengeId")
                 val challenge = data.getString("challenge")
                 require(id.matches(Regex("[0-9a-fA-F-]{36}")) && challenge.matches(Regex("[A-Za-z0-9_-]{43}")))
-                val sent = write(JSONObject().put("action", "authProof").put("challengeId", id)
+                write(JSONObject().put("action", "authProof").put("challengeId", id)
                     .put("signature", sign(authenticationBytes(nodeId, id, challenge))))
-                PlexusDiagnostics.lifecycle("AUTH_PROOF_SENT generation=$generation accepted=$sent")
             }
             "auth:success" -> {
                 require(data.getString("nodeId") == nodeId)
                 if (authenticated) return
                 cancelTimer()
                 authenticated = true
-                PlexusDiagnostics.lifecycle("AUTH_SUCCESS generation=$generation")
                 // Server automatically sends the first sync page to this exact connection.
                 syncing = true
                 armSyncTimeout()
@@ -188,9 +182,6 @@ internal class InternetSession(
                 require(authenticated && data.optBoolean("accepted", false))
                 if (offer.action == "deliveryProof") {
                     require(data.optString("messageId") == offer.packet.getString("messageId"))
-                }
-                if (offer.action == "sendPacket" && offer.packet.optString("type") == "mesh_message") {
-                    PlexusDiagnostics.lifecycle("SEND_PACKET_ACKED id=${PlexusDiagnostics.shortId(offer.packet.optString("packetId"))} generation=$generation")
                 }
                 cancelTimer()
                 inFlight = null
@@ -207,7 +198,6 @@ internal class InternetSession(
                 syncTimer = null
                 syncing = false
                 val cursor = data.optString("cursor")
-                PlexusDiagnostics.lifecycle("SYNC_COMPLETE generation=$generation more=${cursor.isNotEmpty()} busy=${data.optBoolean("busy", false)}")
                 if (cursor.isNotEmpty()) requestSync(cursor)
                 else if (syncAgain) { syncAgain = false; requestSync() }
                 else observer.syncComplete(data.optBoolean("busy", false))
@@ -224,9 +214,6 @@ internal class InternetSession(
                 } else fail(generation, "SERVER_RETRY_REQUIRED")
             }
             else -> if (authenticated) {
-                if (event == "internet:packet") {
-                    PlexusDiagnostics.lifecycle("SYNC_MESSAGE_RECEIVED id=${PlexusDiagnostics.shortId(data.optString("packetId"))} generation=$generation syncing=$syncing")
-                }
                 observer.event(event, data)
             }
         }
@@ -275,9 +262,6 @@ internal class InternetSession(
         arm(20_000) { fail(token, "PERSISTENCE_ACK_TIMEOUT") }
         if (!write(wire(offer))) fail(token, "WEBSOCKET_BACKPRESSURE")
         else if (offer.action == "deliveryProof") observer.proofDispatched(offer.packet)
-        else if (offer.action == "sendPacket" && offer.packet.optString("type") == "mesh_message") {
-            PlexusDiagnostics.lifecycle("SEND_PACKET_DISPATCHED id=${PlexusDiagnostics.shortId(offer.packet.optString("packetId"))} generation=$generation")
-        }
     }
     fun requestSync(cursor: String = "") {
         if (!authenticated) return
@@ -290,8 +274,7 @@ internal class InternetSession(
         val token = generation
         val task = Runnable {
             if (running && authenticated && generation == token) {
-                val sent = write(JSONObject().put("action", "sync").put("cursor", cursor))
-                PlexusDiagnostics.lifecycle("SYNC_REQUEST_SENT generation=$token continuation=${cursor.isNotEmpty()} accepted=$sent")
+                write(JSONObject().put("action", "sync").put("cursor", cursor))
                 armSyncTimeout()
             }
         }
