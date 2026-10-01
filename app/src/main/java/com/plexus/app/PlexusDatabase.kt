@@ -17,7 +17,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ConnectionRequestEntity::class,
         ConversationStateEntity::class
     ],
-    version = 10,
+    version = 11,
     exportSchema = false
 )
 abstract class PlexusDatabase :
@@ -492,6 +492,14 @@ abstract class PlexusDatabase :
         }
 
 
+        internal val MIGRATION_10_11 = object : Migration(10, 11) {
+            override fun migrate(database: SupportSQLiteDatabase) {
+                // Existing proofs have no recorded AWS ACK: retry them once, idempotently.
+                database.execSQL("ALTER TABLE anti_packets ADD COLUMN internetPublishedAt INTEGER")
+            }
+        }
+
+
 
         /*
          * =====================================================
@@ -522,7 +530,7 @@ abstract class PlexusDatabase :
                             /*
                              * Existing installations can upgrade:
                              *
-                             * 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 -> 10
+                             * 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 -> 10 -> 11
                              *
                              * without deleting existing data.
                              */
@@ -543,7 +551,8 @@ abstract class PlexusDatabase :
                                 MIGRATION_7_8,
 
                                 MIGRATION_8_9,
-                                MIGRATION_9_10
+                                MIGRATION_9_10,
+                                MIGRATION_10_11
                             )
 
 

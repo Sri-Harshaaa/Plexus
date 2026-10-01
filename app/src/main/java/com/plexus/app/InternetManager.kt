@@ -19,6 +19,7 @@ class InternetManager(
         fun onDisconnected() {}
         fun onMeshPacketReceived(packet: NearbyMeshPacket) {}
         fun onAntiPacketReceived(packet: NearbyAntiPacket) {}
+        fun onAntiPacketAcknowledged(packet: NearbyAntiPacket) {}
         fun onConnectionRequestReceived(packet: ConnectionRequestPacket) {}
         fun onConnectionResponseReceived(packet: ConnectionResponsePacket) {}
         fun onError(message: String, exception: Exception? = null) {}
@@ -30,20 +31,37 @@ class InternetManager(
             override fun later(task: Runnable, delay: Long) { handler.postDelayed(task, delay) }
             override fun cancel(task: Runnable) { handler.removeCallbacks(task) }
         }, object : InternetSession.Observer {
-            override fun connected() { Log.d(TAG, "WSS CONNECTED"); listener.onConnected() }
-            override fun authenticated() { Log.d(TAG, "WSS AUTHENTICATED"); listener.onAuthenticated() }
+            override fun connected() { Log.d(TAG, "WSS_CONNECTED"); listener.onConnected() }
+            override fun authenticated() { Log.d(TAG, "WSS_AUTHENTICATED"); listener.onAuthenticated() }
             override fun disconnected() { listener.onDisconnected() }
-            override fun error(code: String) { Log.w(TAG, code); listener.onError(code) }
+            override fun error(code: String) {
+                if (code == "STALE_SYNC_RECOVERY" || code == "STALE_SOCKET_RECOVERY") Log.d(TAG, code)
+                else Log.w(TAG, code)
+                listener.onError(code)
+            }
             override fun syncComplete(busy: Boolean) { listener.onSyncComplete(busy) }
+            override fun proofDispatched(packet: JSONObject) {
+                PlexusDiagnostics.message("PROOF_NET_DISPATCHED", packet.optString("messageId"))
+            }
+            override fun proofAcknowledged(packet: JSONObject) {
+                NearbyAntiPacket.fromBytes(packet.toString().toByteArray(Charsets.UTF_8))
+                    ?.let(listener::onAntiPacketAcknowledged)
+            }
             override fun event(name: String, packet: JSONObject) {
                 val bytes = packet.toString().toByteArray(Charsets.UTF_8)
                 when (name) {
                     "internet:packet" -> NearbyMeshPacket.fromBytes(bytes)?.takeIf {
                         it.destinationNodeId == identity.nodeId && !it.isExpired()
-                    }?.let(listener::onMeshPacketReceived)
+                    }?.let {
+                        PlexusDiagnostics.internetPacketReceived(it.packetId)
+                        listener.onMeshPacketReceived(it)
+                    }
                     "internet:anti_packet" -> NearbyAntiPacket.fromBytes(bytes)?.takeIf {
                         !it.isExpired()
-                    }?.let(listener::onAntiPacketReceived)
+                    }?.let {
+                        PlexusDiagnostics.message("DELIVERY_PROOF_RECEIVED", it.messageId, "source=INTERNET")
+                        listener.onAntiPacketReceived(it)
+                    }
                     "internet:connection_request" -> ConnectionRequestPacket.fromBytes(bytes)?.takeIf {
                         it.recipientNodeId == identity.nodeId
                     }?.let(listener::onConnectionRequestReceived)
@@ -60,10 +78,14 @@ class InternetManager(
         }
         session.start()
     }
-    fun sendMeshPacket(packet: NearbyMeshPacket): Boolean = !packet.isExpired() && packet.originSignature.isNotBlank() &&
-        offer("message:${packet.packetId}", "sendPacket", packet.toBytes(), packet.expiresAt)
-    fun sendAntiPacket(packet: NearbyAntiPacket, background: Boolean = false): Boolean = packet.recipientNodeId == identity.nodeId &&
-        offer("proof:${packet.messageId}", "deliveryProof", packet.toBytes(), packet.expiresAt, background)
+    fun sendMeshPacket(packet: NearbyMeshPacket): Boolean = (!packet.isExpired() && packet.originSignature.isNotBlank() &&
+        offer("message:${packet.packetId}", "sendPacket", packet.toBytes(), packet.expiresAt)).also {
+        PlexusDiagnostics.message("INTERNET_PACKET_OFFERED", packet.packetId, "status=${if (it) "ACCEPTED" else "REJECTED"}")
+    }
+    fun sendAntiPacket(packet: NearbyAntiPacket, background: Boolean = false): Boolean = (packet.recipientNodeId == identity.nodeId &&
+        offer("proof:${packet.messageId}", "deliveryProof", packet.toBytes(), packet.expiresAt, background)).also {
+        PlexusDiagnostics.message("DELIVERY_PROOF_OFFERED", packet.messageId, "transport=INTERNET status=${if (it) "ACCEPTED" else "REJECTED"}")
+    }
     fun sendConnectionRequest(packet: ConnectionRequestPacket): Boolean =
         packet.senderNodeId == identity.nodeId && packet.verify() &&
             offer("request:${packet.requestId}", "sendPacket", packet.toBytes(), packet.expiresAt)
@@ -79,6 +101,10 @@ class InternetManager(
         listener.onRetryPending()
         session.requestSync()
     }
+    fun stopGatewayOffers() { session.stopGatewayOffers() }
+    fun wakeForSync() { session.wakeForSync() }
+    fun setPeerBlocked(peer: String, blocked: Boolean, revision: Long, background: Boolean = false): Boolean = session.setPeerBlocked(peer, blocked, revision, background)
+    fun discardBlockedPacket(key: String, peer: String): Boolean = session.discardBlockedPacket(key, peer)
     fun registerPushToken(token: String): Boolean = session.registerPushToken(token)
     fun stop() { session.stop(); handler.removeCallbacksAndMessages(null) }
     companion object { private const val TAG = "PlexusInternet" }

@@ -4,6 +4,7 @@ import androidx.room.Dao
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import kotlinx.coroutines.flow.Flow
 
 
 @Dao
@@ -113,6 +114,23 @@ interface AntiPacketDao {
         now: Long =
             System.currentTimeMillis()
     ): List<AntiPacketEntity>
+
+    @Query("""
+        SELECT * FROM anti_packets
+        WHERE recipientNodeId = :localNodeId AND internetPublishedAt IS NULL AND expiresAt > :now
+        ORDER BY storedAt ASC, messageId ASC
+    """)
+    fun observeInternetPending(localNodeId: String, now: Long): Flow<List<AntiPacketEntity>>
+
+    @Query("""
+        UPDATE anti_packets SET internetPublishedAt = :acknowledgedAt
+        WHERE messageId = :messageId AND sourceNodeId = :sourceNodeId
+          AND recipientNodeId = :recipientNodeId AND signature = :signature
+          AND deliveredAt = :deliveredAt AND expiresAt = :expiresAt
+          AND internetPublishedAt IS NULL
+    """)
+    suspend fun markInternetPublished(messageId: String, sourceNodeId: String, recipientNodeId: String,
+        signature: String, deliveredAt: Long, expiresAt: Long, acknowledgedAt: Long): Int
 
     @Query("SELECT * FROM anti_packets WHERE expiresAt > :now ORDER BY storedAt ASC LIMIT :limit OFFSET :offset")
     suspend fun getActiveAntiPacketWindow(now: Long, limit: Int, offset: Int): List<AntiPacketEntity>

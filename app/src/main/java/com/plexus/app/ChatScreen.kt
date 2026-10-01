@@ -144,7 +144,8 @@ fun PlexusChatScreen(
 
     onDeleteChat: () -> Unit,
 
-    onEditContactName: (String) -> Unit
+    onEditContactName: (String) -> Unit,
+    onBlockUser: () -> Unit
 
 ) {
 
@@ -527,6 +528,7 @@ fun PlexusChatScreen(
     ) {
 
         PlexusChatHeader(
+            onBlockUserRequest = onBlockUser,
             contact =
                 contact,
 
@@ -1150,7 +1152,8 @@ private fun PlexusChatHeader(
 
     onDeleteChatRequest: () -> Unit,
 
-    onEditContactNameRequest: () -> Unit
+    onEditContactNameRequest: () -> Unit,
+    onBlockUserRequest: () -> Unit
 
 ) {
 
@@ -1388,6 +1391,12 @@ private fun PlexusChatHeader(
                         onDeleteChatRequest()
                     }
                 )
+                Box(Modifier.fillMaxWidth().height(1.dp).background(PlexusDivider))
+                DropdownMenuItem(
+                    text = { Text("Block user", color = Color(0xFFFF8A80)) },
+                    onClick = { menuExpanded = false; onBlockUserRequest() }
+                )
+
             }
         }
     }

@@ -1,6 +1,7 @@
 package com.plexus.app
 
 import android.content.Context
+import android.util.Log
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingWorkPolicy
@@ -11,6 +12,7 @@ import androidx.work.WorkManager
 import androidx.work.WorkerParameters
 import com.google.firebase.messaging.FirebaseMessagingService
 import com.google.firebase.messaging.RemoteMessage
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.coroutines.resume
@@ -27,24 +29,92 @@ internal object PlexusPushToken {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(TOKEN, null)
 }
 
+/** A running pass snapshots the durable wake generation; later wakes require another pass. */
+internal class PendingSyncWakes(var requested: Long = 0, var completed: Long = 0) {
+    private var scheduledId: String? = null
+    private var runningId: String? = null
+    private var waitingRetry = false
+
+    fun wake(workId: String): Boolean {
+        requested++
+        if (runningId != null || (scheduledId != null && !waitingRetry)) return false
+        scheduledId = workId
+        waitingRetry = false
+        return true
+    }
+
+    fun begin(workId: String): Boolean {
+        if (runningId != null || (scheduledId != null && scheduledId != workId)) return false
+        runningId = workId
+        waitingRetry = false
+        return true
+    }
+
+    fun finishPass(workId: String, generation: Long): Boolean {
+        check(runningId == workId)
+        completed = maxOf(completed, generation)
+        if (requested > completed) return true
+        runningId = null
+        scheduledId = null
+        waitingRetry = false
+        return false
+    }
+
+    fun failedPass(workId: String, generation: Long): Boolean {
+        check(runningId == workId)
+        if (requested > generation) return true
+        runningId = null
+        waitingRetry = true
+        return false
+    }
+
+    fun release(workId: String) {
+        if (runningId == workId) {
+            runningId = null
+            waitingRetry = true
+        }
+    }
+}
+
 internal object PlexusSyncWork {
     private const val UNIQUE_NAME = "plexus-pending-sync"
+    private const val PREFS = "plexus_sync_wakes"
+    private var wakes: PendingSyncWakes? = null
 
-    fun enqueue(context: Context) {
+    private fun state(context: Context): PendingSyncWakes = wakes ?: context
+        .getSharedPreferences(PREFS, Context.MODE_PRIVATE).let {
+            PendingSyncWakes(it.getLong("requested", 0), it.getLong("completed", 0)).also { state -> wakes = state }
+        }
+
+    private fun persist(context: Context, state: PendingSyncWakes) {
+        check(context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putLong("requested", state.requested).putLong("completed", state.completed).commit())
+    }
+
+    @Synchronized fun enqueue(context: Context) {
         val request = OneTimeWorkRequestBuilder<PlexusPendingSyncWorker>()
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
             .build()
-        enqueue { name, policy ->
-            WorkManager.getInstance(context).enqueueUniqueWork(name, policy, request)
-        }
+        val state = state(context)
+        val schedule = state.wake(request.id.toString())
+        persist(context, state)
+        if (schedule) {
+            // No useful worker is running: replace queued/backoff work, never append a chain.
+            WorkManager.getInstance(context).enqueueUniqueWork(UNIQUE_NAME, ExistingWorkPolicy.REPLACE, request)
+            Log.d("PlexusSync", "SYNC_WORK_ENQUEUED")
+        } else Log.d("PlexusSync", "SYNC_WAKE_COALESCED")
+        PlexusPersonalMessaging.wakeForSync()
     }
 
-    internal fun enqueue(enqueueUniqueWork: (String, ExistingWorkPolicy) -> Unit) {
-        // Append a follow-up even when the current sync has already queried AWS.
-        // A failed/cancelled old chain must not prevent a fresh wake from syncing.
-        enqueueUniqueWork(UNIQUE_NAME, ExistingWorkPolicy.APPEND_OR_REPLACE)
+    @Synchronized fun begin(context: Context, id: String): Boolean = state(context).begin(id)
+    @Synchronized fun generation(context: Context): Long = state(context).requested
+    @Synchronized fun finishPass(context: Context, id: String, generation: Long): Boolean {
+        val state = state(context)
+        return state.finishPass(id, generation).also { persist(context, state) }
     }
+    @Synchronized fun failedPass(context: Context, id: String, generation: Long): Boolean = state(context).failedPass(id, generation)
+    @Synchronized fun release(context: Context, id: String) { state(context).release(id) }
 }
 
 class PlexusFirebaseMessagingService : FirebaseMessagingService() {
@@ -56,19 +126,54 @@ class PlexusFirebaseMessagingService : FirebaseMessagingService() {
     }
 
     override fun onMessageReceived(message: RemoteMessage) {
-        if (message.data["type"] == "plexus_sync") PlexusSyncWork.enqueue(applicationContext)
+        if (message.data["type"] == "plexus_sync") {
+            PlexusDiagnostics.lifecycle("FCM_SYNC_WAKE_RECEIVED")
+            PlexusSyncWork.enqueue(applicationContext)
+        }
     }
 }
 
 class PlexusPendingSyncWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
     override suspend fun doWork(): Result {
-        val completed = withTimeoutOrNull(30_000L) {
-            suspendCancellableCoroutine { continuation ->
-                PlexusPersonalMessaging.syncPending(applicationContext) {
-                    if (continuation.isActive) continuation.resume(Unit)
+        val workId = id.toString()
+        val messagesBefore = PlexusDiagnostics.internetMessageCount()
+        PlexusDiagnostics.lifecycle("SYNC_WORK_STARTED workerId=${PlexusDiagnostics.shortId(workId)}")
+        if (!PlexusSyncWork.begin(applicationContext, workId)) {
+            PlexusDiagnostics.lifecycle("SYNC_WORK_FINISHED workerId=${PlexusDiagnostics.shortId(workId)} fetched=0 result=SKIPPED")
+            return Result.success()
+        }
+        var diagnosticResult = "FAILED"
+        try {
+            while (true) {
+                val generation = PlexusSyncWork.generation(applicationContext)
+                val completed = withTimeoutOrNull(20_000L) {
+                    suspendCancellableCoroutine { continuation ->
+                        val cancel = PlexusPersonalMessaging.syncPending(applicationContext) { published ->
+                            if (continuation.isActive) continuation.resume(published)
+                        }
+                        continuation.invokeOnCancellation { cancel() }
+                    }
+                }
+                if (completed != true) {
+                    Log.d("PlexusSync", if (completed == null) "SYNC_TIMEOUT" else "SYNC_PROOFS_PENDING")
+                    if (PlexusSyncWork.failedPass(applicationContext, workId, generation)) continue
+                    Log.d("PlexusSync", "SYNC_WORK_RETRY")
+                    diagnosticResult = "RETRY"
+                    return Result.retry()
+                }
+                if (!PlexusSyncWork.finishPass(applicationContext, workId, generation)) {
+                    Log.d("PlexusSync", "SYNC_WORK_SUCCESS")
+                    diagnosticResult = "SUCCESS"
+                    return Result.success()
                 }
             }
+        } catch (cancelled: CancellationException) {
+            diagnosticResult = "CANCELLED"
+            PlexusDiagnostics.lifecycle("SYNC_WORK_STOPPED workerId=${PlexusDiagnostics.shortId(workId)} stopReason=$stopReason")
+            throw cancelled
+        } finally {
+            PlexusSyncWork.release(applicationContext, workId)
+            PlexusDiagnostics.lifecycle("SYNC_WORK_FINISHED workerId=${PlexusDiagnostics.shortId(workId)} fetched=${PlexusDiagnostics.internetMessageCount() - messagesBefore} result=$diagnosticResult fetchedScope=INTERNET_MESSAGE_INGRESS")
         }
-        return if (completed != null) Result.success() else Result.retry()
     }
 }

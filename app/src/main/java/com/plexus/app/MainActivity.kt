@@ -4,7 +4,6 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
-import android.graphics.Bitmap
 import android.net.Uri
 import android.os.Bundle
 import android.os.IBinder
@@ -24,6 +23,11 @@ import androidx.compose.animation.shrinkVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -52,6 +56,11 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
@@ -68,6 +77,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
@@ -77,7 +88,6 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.text.TextStyle
@@ -92,8 +102,6 @@ import androidx.compose.ui.window.Dialog
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
-import com.google.zxing.BarcodeFormat
-import com.google.zxing.qrcode.QRCodeWriter
 import com.plexus.app.ui.theme.PlexusTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -131,6 +139,7 @@ private val PlexusDivider =
 enum class PlexusScreen {
     HOME,
     PROFILE,
+    BLOCKED_USERS,
     SCANNER,
     ACCEPTED_CONTACT,
     CHAT
@@ -511,6 +520,9 @@ class MainActivity : ComponentActivity() {
                         )
 
 
+                    val blockedContacts by contactDao.getBlockedContacts().collectAsState(initial = emptyList())
+                    var blockTarget by remember { mutableStateOf<ContactEntity?>(null) }
+                    var blockedImport by remember { mutableStateOf<Triple<String, ContactEntity, PlexusScreen>?>(null) }
                     val coroutineScope =
                         rememberCoroutineScope()
                     val outgoingSendMutex = remember { Mutex() }
@@ -549,7 +561,7 @@ class MainActivity : ComponentActivity() {
 
 
                     var currentScreen by
-                    remember {
+                    rememberSaveable {
 
                         mutableStateOf(
                             PlexusScreen.HOME
@@ -613,10 +625,20 @@ class MainActivity : ComponentActivity() {
                             }
                         )
                     }
+                    LaunchedEffect(contacts, selectedContact?.nodeId, currentScreen) {
+                        val selected = selectedContact ?: return@LaunchedEffect
+                        if (currentScreen != PlexusScreen.CHAT) return@LaunchedEffect
+                        val current = contactDao.getContactById(selected.nodeId)
+                        if (current?.relationshipState != ContactRelationshipState.CONNECTED) {
+                            selectedContact = null
+                            setVisibleChat(null)
+                            currentScreen = PlexusScreen.HOME
+                        } else if (selectedContact?.nodeId == current.nodeId) selectedContact = current
+                    }
                     LaunchedEffect(pendingConversationContactId) {
                         val contactNodeId = pendingConversationContactId ?: return@LaunchedEffect
                         val contact = contactDao.getContactById(contactNodeId)
-                        if (contact != null) {
+                        if (contact?.relationshipState == ContactRelationshipState.CONNECTED) {
                             selectedContact = contact
                             currentScreen = PlexusScreen.CHAT
                         }
@@ -710,8 +732,8 @@ class MainActivity : ComponentActivity() {
                                     /*
                                      * nodeId is the relationship dedup key.
                                      *
-                                     * Re-importing an identity in ANY relationship
-                                     * state must not resend or reset anything.
+                                     * Explicit imports may renew an outgoing attempt with a fresh ID.
+                                     * Connected identities reopen; incoming/blocked states stay guarded.
                                      */
                                     val existingRelationship =
                                         contactDao
@@ -720,9 +742,18 @@ class MainActivity : ComponentActivity() {
                                             )
 
 
-                                    if (
-                                        existingRelationship != null
-                                    ) {
+                                    if (existingRelationship != null && ContactRelationshipState.isBlocked(existingRelationship.relationshipState)) {
+                                        blockedImport = Triple(rawIdentityPayload, existingRelationship, returnScreen)
+                                        currentScreen = returnScreen
+                                        return@launch
+                                    }
+                                    if (existingRelationship != null &&
+                                        (existingRelationship.signingPublicKey != importedIdentity.signingPublicKey ||
+                                            existingRelationship.agreementPublicKey != importedIdentity.agreementPublicKey)) {
+                                        currentScreen = returnScreen
+                                        return@launch
+                                    }
+                                    if (existingRelationship != null && !ContactRelationshipState.canInitiateRequest(existingRelationship.relationshipState)) {
 
 
                                         if (
@@ -736,19 +767,9 @@ class MainActivity : ComponentActivity() {
                                              * simply unhides/reopens the existing conversation
                                              * instead of creating another connection request.
                                              */
-                                            conversationStateDao
-                                                .setConversationHidden(
-
-                                                    contactNodeId =
-                                                        existingRelationship.nodeId,
-
-                                                    hidden =
-                                                        false
-                                                )
-
-
-                                            selectedContact =
-                                                existingRelationship
+                                            val reopened = ContactRelationships(database).reopenTrustedContact(existingRelationship)
+                                                ?: return@launch
+                                            selectedContact = reopened
 
                                             currentScreen =
                                                 PlexusScreen.CHAT
@@ -785,86 +806,11 @@ class MainActivity : ComponentActivity() {
                                      * relationship row so pendingRequestId always refers
                                      * to a real durable request.
                                      */
-                                    val requestPacket =
-                                        ConnectionRequestPacket
-                                            .create(
-
-                                                senderIdentity =
-                                                    identity,
-
-                                                recipientNodeId =
-                                                    importedIdentity.nodeId
-                                            )
-
-
-                                    val insertedRequestId =
-                                        connectionRequestDao
-                                            .insertRequest(
-
-                                                ConnectionRequestEntity
-                                                    .fromPacket(
-                                                        requestPacket
-                                                    )
-                                            )
-
-
-                                    if (
-                                        insertedRequestId ==
-                                        -1L
-                                    ) {
-
-
-                                        Log.d(
-                                            "PlexusContact",
-                                            "$source REQUEST CREATION SKIPPED - DUPLICATE REQUEST -> " +
-                                                    requestPacket.requestId.take(8)
-                                        )
-
-
-                                        currentScreen =
-                                            returnScreen
-
-
-                                        return@launch
+                                    val requestPacket = withContext(Dispatchers.IO) {
+                                        ConnectionRequestPacket.create(senderIdentity = identity, recipientNodeId = importedIdentity.nodeId)
                                     }
-
-
-                                    /*
-                                     * Keep the imported identity pinned while the
-                                     * relationship waits for acceptance.
-                                     *
-                                     * getAllContacts() hides OUTGOING_PENDING rows,
-                                     * therefore no normal chat preview appears yet.
-                                     */
-                                    contactDao
-                                        .insertContact(
-
-                                            ContactEntity(
-
-                                                nodeId =
-                                                    importedIdentity.nodeId,
-
-                                                displayName =
-                                                    importedIdentity.displayName,
-
-                                                signingPublicKey =
-                                                    importedIdentity.signingPublicKey,
-
-                                                agreementPublicKey =
-                                                    importedIdentity.agreementPublicKey,
-
-                                                announcedDisplayName =
-                                                    importedIdentity.displayName,
-
-                                                relationshipState =
-                                                    ContactRelationshipState
-                                                        .OUTGOING_PENDING,
-
-                                                pendingRequestId =
-                                                    requestPacket.requestId
-                                            )
-                                        )
-
+                                    val stored = ContactRelationships(database).queueOutgoingRequest(requestPacket, importedIdentity)
+                                    if (!stored) { currentScreen = returnScreen; return@launch }
 
                                     /*
                                      * Offer the exact same signed request to both
@@ -1114,30 +1060,8 @@ class MainActivity : ComponentActivity() {
                                  * still be retried after restart if both transports
                                  * are unavailable at this exact moment.
                                  */
-                                contactDao
-                                    .updateDisplayName(
-
-                                        nodeId =
-                                            currentRelationship.nodeId,
-
-                                        displayName =
-                                            cleanDisplayName
-                                    )
-
-
-                                contactDao
-                                    .updateRelationshipState(
-
-                                        nodeId =
-                                            currentRelationship.nodeId,
-
-                                        relationshipState =
-                                            ContactRelationshipState.CONNECTED,
-
-                                        pendingRequestId =
-                                            requestId
-                                    )
-
+                                if (!ContactRelationships(database).decideIncoming(currentRelationship.nodeId, requestId,
+                                        accepted = true, displayName = cleanDisplayName)) return@acceptRequest false
 
                                 val sentInternet =
                                     transport.sendConnectionResponse(
@@ -1272,19 +1196,8 @@ class MainActivity : ComponentActivity() {
                                  * while retaining requestId so the signed decline can be
                                  * retried later if delivery fails right now.
                                  */
-                                contactDao
-                                    .updateRelationshipState(
-
-                                        nodeId =
-                                            currentRelationship.nodeId,
-
-                                        relationshipState =
-                                            ContactRelationshipState.DECLINED,
-
-                                        pendingRequestId =
-                                            requestId
-                                    )
-
+                                if (!ContactRelationships(database).decideIncoming(currentRelationship.nodeId, requestId,
+                                        accepted = false)) return@declineRequest false
 
                                 val sentInternet =
                                     transport.sendConnectionResponse(
@@ -1339,11 +1252,60 @@ class MainActivity : ComponentActivity() {
 
 
 
+                    blockTarget?.let { target ->
+                        PlexusBlockConfirmation(target, onConfirm = {
+                            blockTarget = null
+                            coroutineScope.launch {
+                                val rejectedRequest = ContactRelationships(database).block(target.nodeId, identity.nodeId)?.toPacket()
+                                IncomingMessageNotifier(applicationContext).cancelConversation(target.nodeId)
+                                PlexusPersonalMessaging.refreshPeerPolicy()
+                                if (selectedContact?.nodeId == target.nodeId) {
+                                    selectedContact = null
+                                    setVisibleChat(null)
+                                    currentScreen = PlexusScreen.HOME
+                                }
+                                // The durable block and UI/policy cleanup must survive an optional send failure.
+                                try {
+                                    if (rejectedRequest != null && rejectedRequest.verify()) {
+                                        val response = withContext(Dispatchers.IO) {
+                                            ConnectionResponsePacket.createDeclined(rejectedRequest, identity)
+                                        }
+                                        transport.sendConnectionResponse(response)
+                                        transport.sendBytesToNode(target.nodeId, response.toBytes(), NearbyManager.SendPriority.CONTROL)
+                                    }
+                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    Log.w("PlexusContact", "BLOCK_RESPONSE_DEFERRED")
+                                }
+                            }
+                        }, onDismiss = { blockTarget = null })
+                    }
+                    blockedImport?.let { pending ->
+                        AlertDialog(
+                            onDismissRequest = { blockedImport = null },
+                            title = { Text("You blocked this user.") },
+                            text = { Text("Unblock them before sending a connection request.") },
+                            dismissButton = { TextButton(onClick = { blockedImport = null }) { Text("Cancel") } },
+                            confirmButton = { TextButton(onClick = {
+                                blockedImport = null
+                                coroutineScope.launch {
+                                    ContactRelationships(database).unblock(pending.second.nodeId)
+                                    PlexusPersonalMessaging.refreshPeerPolicy()
+                                    importContactIdentity(pending.first, pending.third, "UNBLOCK")
+                                }
+                            }) { Text("Unblock", color = PlexusGreen) } },
+                            containerColor = PlexusSurfaceRaised,
+                            titleContentColor = Color.White, textContentColor = PlexusSecondary
+                        )
+                    }
+
                     BackHandler(
 
                         enabled =
                             currentScreen ==
                                     PlexusScreen.PROFILE ||
+                                    currentScreen == PlexusScreen.BLOCKED_USERS ||
                                     currentScreen ==
                                     PlexusScreen.SCANNER ||
                                     currentScreen ==
@@ -1355,7 +1317,7 @@ class MainActivity : ComponentActivity() {
                             currentScreen
                         ) {
 
-                            PlexusScreen.PROFILE -> {
+                            PlexusScreen.PROFILE, PlexusScreen.BLOCKED_USERS -> {
 
                                 currentScreen =
                                     PlexusScreen.HOME
@@ -1416,6 +1378,8 @@ class MainActivity : ComponentActivity() {
 
                                 onIncomingRequestDecline =
                                     declineIncomingRequest,
+                                onBlockUser = { blockTarget = it },
+                                onBlockedUsersClick = { currentScreen = PlexusScreen.BLOCKED_USERS },
 
                                 onAcceptedContactClick = { acceptedContact ->
 
@@ -1478,6 +1442,15 @@ class MainActivity : ComponentActivity() {
                             )
                         }
 
+
+                        PlexusScreen.BLOCKED_USERS -> {
+                            PlexusBlockedUsersScreen(blockedContacts,
+                                onBack = { currentScreen = PlexusScreen.HOME },
+                                onUnblock = { contact -> coroutineScope.launch {
+                                    ContactRelationships(database).unblock(contact.nodeId)
+                                    PlexusPersonalMessaging.refreshPeerPolicy()
+                                } })
+                        }
 
                         PlexusScreen.PROFILE -> {
 
@@ -2060,6 +2033,7 @@ class MainActivity : ComponentActivity() {
 
 
                                 PlexusChatScreen(
+                                    onBlockUser = { blockTarget = contact },
 
                                     contact =
                                         contact,
@@ -2276,6 +2250,9 @@ class MainActivity : ComponentActivity() {
                                                         )
 
 
+                                                PlexusDiagnostics.message("OUTGOING_MESSAGE_CREATED", encryptedPacket.messageId,
+                                                    "destination=${PlexusDiagnostics.shortId(contact.nodeId)}")
+
                                                 val outgoingMessage =
                                                     MessageEntity(
 
@@ -2322,6 +2299,7 @@ class MainActivity : ComponentActivity() {
                                                                 NearbyMeshPacket.create(encryptedPacket, identity)
                                                             }
                                                             val result = database.withTransaction {
+                                                                if (contactDao.getContactById(contact.nodeId)?.relationshipState != ContactRelationshipState.CONNECTED) return@withTransaction MeshRelayStore.StoreResult.INVALID
                                                                 val stored = meshRelayStore.store(packet, locallyCreated = true)
                                                                 if (stored == MeshRelayStore.StoreResult.STORED ||
                                                                     stored == MeshRelayStore.StoreResult.DUPLICATE) {
@@ -3571,8 +3549,11 @@ private fun PlexusAcceptedContactScreen(
 private fun PlexusIncomingRequestCard(
     request: ContactEntity,
     onAccept: suspend (ContactEntity, String) -> Boolean,
-    onDecline: suspend (ContactEntity) -> Boolean
+    onDecline: suspend (ContactEntity) -> Boolean,
+    onBlockUser: (ContactEntity) -> Unit
 ) {
+
+    var overflowExpanded by remember(request.nodeId) { mutableStateOf(false) }
 
     val announcedName =
         request
@@ -3765,7 +3746,7 @@ private fun PlexusIncomingRequestCard(
                 .fillMaxWidth()
                 .padding(
                     horizontal =
-                        16.dp
+                        12.dp
                 )
                 .clip(
                     RoundedCornerShape(
@@ -3784,7 +3765,7 @@ private fun PlexusIncomingRequestCard(
                     .fillMaxWidth()
                     .padding(
                         horizontal =
-                            14.dp,
+                            12.dp,
 
                         vertical =
                             13.dp
@@ -3800,7 +3781,7 @@ private fun PlexusIncomingRequestCard(
                         request.nodeId,
 
                     size =
-                        48.dp,
+                        40.dp,
 
                     borderColor =
                         Color.Transparent
@@ -3914,6 +3895,20 @@ private fun PlexusIncomingRequestCard(
                         }
                     )
                 }
+                    Box(Modifier.width(1.dp).height(24.dp).background(PlexusDivider))
+                    Box {
+                        IconButton(onClick = { overflowExpanded = true }, enabled = !actionInProgress,
+                            modifier = Modifier.width(40.dp).height(48.dp).semantics { contentDescription = "Request actions" }) {
+                            Text("⋮", color = Color.White, fontSize = 24.sp)
+                        }
+                        DropdownMenu(expanded = overflowExpanded, onDismissRequest = { overflowExpanded = false },
+                            containerColor = PlexusSurfaceRaised) {
+                            DropdownMenuItem(text = { Text("Block user", color = Color(0xFFFF8A80)) }, onClick = {
+                                overflowExpanded = false; onBlockUser(request)
+                            })
+                        }
+                    }
+
             }
 
 
@@ -3962,7 +3957,7 @@ private fun PlexusIncomingRequestCard(
                     Spacer(
                         modifier =
                             Modifier.height(
-                                12.dp
+                                8.dp
                             )
                     )
 
@@ -4489,6 +4484,26 @@ private fun Modifier.clearFocusAfterTap(
 
 
 @Composable
+private fun PlexusProfileMenuItem(label: String, onClick: () -> Unit) {
+    val interactions = remember { MutableInteractionSource() }
+    val pressed by interactions.collectIsPressedAsState()
+    var touching by remember { mutableStateOf(false) }
+    DropdownMenuItem(text = { Text(label, color = Color.White) }, onClick = onClick,
+        interactionSource = interactions,
+        modifier = Modifier
+            .background(if (touching || pressed) Color.White.copy(alpha = 0.12f) else Color.Transparent)
+            .pointerInput(Unit) {
+                // Observe without consuming: Material still owns clicks/ripple and scroll cancellation.
+                awaitEachGesture {
+                    awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                    touching = true
+                    try { waitForUpOrCancellation(pass = PointerEventPass.Initial) }
+                    finally { touching = false }
+                }
+            })
+}
+
+@Composable
 fun PlexusHomeScreen(
     contacts: List<ContactEntity>,
     incomingRequests: List<ContactEntity>,
@@ -4500,10 +4515,14 @@ fun PlexusHomeScreen(
     onIncomingRequestDecline: suspend (ContactEntity) -> Boolean,
     onAcceptedContactClick: (ContactEntity) -> Unit,
     onProfileClick: () -> Unit,
+    onBlockedUsersClick: () -> Unit,
+    onBlockUser: (ContactEntity) -> Unit,
     onScanClick: () -> Unit,
     onContactClick: (ContactEntity) -> Unit,
     onDeleteChat: (ContactEntity) -> Unit
 ) {
+
+    var profileMenuExpanded by remember { mutableStateOf(false) }
 
     var searchText by
     remember {
@@ -4714,10 +4733,11 @@ fun PlexusHomeScreen(
                     .size(
                         42.dp
                     )
+                    .semantics { contentDescription = "Profile menu" }
                     .clickable {
 
                         clearSearchFocus()
-                        onProfileClick()
+                        profileMenuExpanded = true
                     },
 
                 contentAlignment =
@@ -4734,6 +4754,15 @@ fun PlexusHomeScreen(
                     borderColor =
                         Color.White
                 )
+                DropdownMenu(expanded = profileMenuExpanded, onDismissRequest = { profileMenuExpanded = false },
+                    containerColor = PlexusSurfaceRaised) {
+                    PlexusProfileMenuItem("View profile", onClick = {
+                        profileMenuExpanded = false; onProfileClick()
+                    })
+                    PlexusProfileMenuItem("Blocked users", onClick = {
+                        profileMenuExpanded = false; onBlockedUsersClick()
+                    })
+                }
             }
         }
 
@@ -4946,7 +4975,8 @@ fun PlexusHomeScreen(
                                 onIncomingRequestAccept,
 
                             onDecline =
-                                onIncomingRequestDecline
+                                onIncomingRequestDecline,
+                            onBlockUser = onBlockUser
                         )
                     }
                 }
@@ -5907,21 +5937,6 @@ fun PlexusProfileScreen(
     }
 
 
-    val qrBitmap =
-        remember(
-            identity.qrPayload
-        ) {
-
-            generateQrCode(
-                content =
-                    identity.qrPayload,
-
-                size =
-                    900
-            )
-        }
-
-
     val shareableLink =
         remember(
             identity.qrPayload
@@ -6263,17 +6278,8 @@ fun PlexusProfileScreen(
                 ) {
 
 
-                    Image(
-                        bitmap =
-                            qrBitmap
-                                .asImageBitmap(),
+                    key(identity.qrPayload) { PlexusIdentityQr(identity.qrPayload) }
 
-                        contentDescription =
-                            "Your Plexus identity QR",
-
-                        modifier =
-                            Modifier.fillMaxSize()
-                    )
                 }
 
 
@@ -6521,23 +6527,7 @@ fun PlexusProfileScreen(
                 11.sp
         )
 
-        Spacer(modifier = Modifier.height(20.dp))
-
-        Text(
-            text = "If offline messaging or relay stops working while your screen is off, your phone may be restricting Plexus in the background. Check battery optimization settings.",
-            color = PlexusMuted,
-            fontSize = 11.sp,
-            textAlign = TextAlign.Center
-        )
-
-
-        Spacer(
-            modifier =
-                Modifier.height(
-                    18.dp
-                )
-        )
-
+        Spacer(modifier = Modifier.height(16.dp))
 
         Button(
             onClick =
@@ -6608,6 +6598,21 @@ fun PlexusProfileScreen(
             }
         }
 
+
+        Spacer(Modifier.height(16.dp))
+        Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(PlexusSurfaceRaised).padding(16.dp),
+            verticalAlignment = Alignment.Top) {
+            Text("ⓘ", color = PlexusSecondary, fontSize = 18.sp)
+            Spacer(Modifier.width(10.dp))
+            Column {
+                Text("Background activity", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.height(6.dp))
+                Text("If offline messaging or relay stops working while your screen is off, your phone may be restricting Plexus in the background.",
+                    color = PlexusSecondary, fontSize = 12.sp)
+                Spacer(Modifier.height(6.dp))
+                Text("Check battery optimization settings.", color = PlexusSecondary, fontSize = 12.sp)
+            }
+        }
 
         Spacer(
             modifier =
@@ -7784,63 +7789,6 @@ private fun PlexusBackArrow(
                 StrokeCap.Round
         )
     }
-}
-
-
-fun generateQrCode(
-    content: String,
-    size: Int
-): Bitmap {
-
-    val writer =
-        QRCodeWriter()
-
-
-    val matrix =
-        writer.encode(
-            content,
-            BarcodeFormat.QR_CODE,
-            size,
-            size
-        )
-
-
-    val bitmap =
-        Bitmap.createBitmap(
-            size,
-            size,
-            Bitmap.Config.RGB_565
-        )
-
-
-    for (
-    x in 0 until size
-    ) {
-
-        for (
-        y in 0 until size
-        ) {
-
-            bitmap.setPixel(
-                x,
-                y,
-
-                if (
-                    matrix[x, y]
-                ) {
-
-                    android.graphics.Color.BLACK
-
-                } else {
-
-                    android.graphics.Color.WHITE
-                }
-            )
-        }
-    }
-
-
-    return bitmap
 }
 
 

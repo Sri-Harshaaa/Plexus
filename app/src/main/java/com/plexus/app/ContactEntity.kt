@@ -14,6 +14,18 @@ import androidx.room.PrimaryKey
  * Room TypeConverter just for an enum.
  */
 object ContactRelationshipState {
+    const val BLOCKED = "BLOCKED"
+    const val BLOCKED_CONNECTED = "BLOCKED_CONNECTED"
+
+    fun isBlocked(state: String?): Boolean = state == BLOCKED || state == BLOCKED_CONNECTED
+    const val NONE = "NONE"
+
+    fun canRequest(state: String?): Boolean = state == null || state == DECLINED || state == NONE
+    // An explicit QR/link import can supersede an outgoing attempt whose closure never arrived.
+    // Incoming requests still use canRequest: they cannot replace a pending user decision.
+    fun canInitiateRequest(state: String?): Boolean = canRequest(state) || state == OUTGOING_PENDING
+    fun canReceiveMessages(state: String?): Boolean = state == CONNECTED || state == ACCEPTED_NEEDS_NAME
+
 
     /*
      * We sent a connection request to this identity

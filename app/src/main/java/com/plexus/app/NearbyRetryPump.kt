@@ -26,7 +26,9 @@ internal suspend fun retryNearbyPackets(
         val relayOffset = manager.nextBackgroundOffset("$peer:relay", relays.size, 2)
         for (vaccine in vaccines) {
             if (!manager.isNodeVerified(peer) || !manager.hasBackgroundCapacity(peer) ||
-                !manager.sendBytesToNode(peer, vaccine.toBytes(), NearbyManager.SendPriority.BACKGROUND)) break
+                !PlexusDiagnostics.proofOffer("NEARBY", vaccine.messageId) {
+                    manager.sendBytesToNode(peer, vaccine.toBytes(), NearbyManager.SendPriority.BACKGROUND)
+                }) break
         }
         for (relay in relays.drop(relayOffset).take(2)) {
             if (!manager.isNodeVerified(peer) || !manager.hasBackgroundCapacity(peer) ||

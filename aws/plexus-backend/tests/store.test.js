@@ -103,3 +103,81 @@ test('conditional lease and rate limits live in DynamoDB, not local maps', async
     assert.match(s.calls[1].input.ConditionExpression, /syncUntil < :now/);
     assert.equal(s.calls[2].input.ConditionExpression, 'syncToken = :token');
 });
+
+test('discard reservation is immutable, expires with the packet, and is persisted before cleanup', async () => {
+    const s = setup(), a = identity(), b = identity(), p = message(a, b, Date.now());
+    const item = row(p, { id: p.packetId, type: 'MESSAGE', source: a.nodeId, destination: b.nodeId, priority: 2, event: 'internet:packet' });
+    await s.store.discardBlocked(item);
+    const reservation = s.calls[0].input;
+    assert.equal(s.calls[0].constructor.name, 'UpdateCommand');
+    assert.match(reservation.ConditionExpression, /sourceNodeId = :source AND recipientNodeId = :dest/);
+    assert.match(reservation.ConditionExpression, /packetDigest = :digest/);
+    assert.match(reservation.UpdateExpression, /#ttl = if_not_exists\(#ttl, :ttl\)/);
+    assert.equal(reservation.ExpressionAttributeValues[':ttl'], item.ttl);
+    assert.doesNotMatch(reservation.UpdateExpression, /proof/);
+    assert.equal(s.calls[1].constructor.name, 'DeleteCommand');
+    assert.deepEqual(s.calls[1].input.Key, { destinationNodeId: b.nodeId, packetKey: item.packetKey });
+    const queued = setup(); await queued.store.queueMessage(item);
+    assert.match(queued.calls[0].input.TransactItems[0].Update.ConditionExpression, /attribute_not_exists\(discarded\)/);
+});
+test('peer policy uses authoritative reads and monotonically conditioned writes outside packet range', async () => {
+    const s = setup(); await s.store.peerBlocked('owner', 'peer'); await s.store.setPeerBlocked('owner', 'peer', true, 10);
+    assert.equal(s.calls[0].input.ConsistentRead, true);
+    assert.deepEqual(s.calls[0].input.Key, { destinationNodeId: 'owner', packetKey: '7#BLOCK#peer' });
+    assert.equal(s.calls[1].input.ConditionExpression, 'attribute_not_exists(revision) OR revision <= :revision');
+    assert.equal(s.calls[1].input.Item.packetKey < '3', false);
+});
+
+test('message lane claims a single row with a strong prefix query and a bounded expiring checkpoint outside packet keys', async () => {
+    const cursor = { destinationNodeId: 'node', packetKey: '2#005#MESSAGE#m' };
+    const s = setup([{}, { Items: [{ ...cursor, packetType: 'MESSAGE' }], LastEvaluatedKey: cursor }, {}]);
+    await s.store.claimSyncPage('node', true, 1000);
+    const [read, query, write] = s.calls.map(c => c.input);
+    assert.equal(read.ConsistentRead, true);
+    assert.deepEqual(read.Key, { destinationNodeId: 'node', packetKey: '6#SYNC#MESSAGE' });
+    assert.equal(query.ConsistentRead, true);
+    assert.equal(query.Limit, 1);
+    assert.equal(query.KeyConditionExpression, 'destinationNodeId = :node AND begins_with(packetKey, :prefix)');
+    assert.deepEqual(query.ExpressionAttributeValues, { ':node': 'node', ':prefix': '2#' });
+    assert.deepEqual(write.Item.cursor, cursor);
+    assert.equal(write.Item.expiresAt, 1000 + 7 * 86400000);
+    assert.equal(write.Item.ttl, 1 + 7 * 86400);
+    assert.equal(write.ConditionExpression, 'attribute_not_exists(packetKey)');
+    assert.ok(write.Item.packetKey > '3'); // Neither normal sync nor message lane can return it.
+});
+
+test('new store instance resumes durable traversal and does not trust a client-owned cursor', async () => {
+    const cursor = { destinationNodeId: 'node', packetKey: '0#020#DELIVERY_PROOF#m' };
+    const s = setup([{ Item: { cursor, revision: 'previous', expiresAt: 9999 } },
+        { Items: [{ packetKey: '0#021#DELIVERY_PROOF#m' }] }, {}]);
+    await s.store.claimSyncPage('node', false, 1000);
+    assert.deepEqual(s.calls[1].input.ExclusiveStartKey, cursor);
+    assert.equal(s.calls[1].input.Limit, 20);
+    assert.equal(s.calls[2].input.ConditionExpression, 'revision = :revision');
+    assert.deepEqual(s.calls[2].input.ExpressionAttributeValues, { ':revision': 'previous' });
+    assert.equal(s.calls[2].input.Item.cursor, undefined); // End wraps next opportunity.
+});
+
+test('deleted final message cursor wraps immediately instead of wasting a message opportunity', async () => {
+    const cursor = { destinationNodeId: 'node', packetKey: '2#last' };
+    const s = setup([{ Item: { cursor, revision: 'r', expiresAt: 9999 } }, { Items: [] },
+        { Items: [{ packetKey: '2#first' }] }, {}]);
+    const page = await s.store.claimSyncPage('node', true, 1000);
+    assert.equal(page.items[0].packetKey, '2#first');
+    assert.deepEqual(s.calls[1].input.ExclusiveStartKey, cursor);
+    assert.equal(s.calls[2].input.ExclusiveStartKey, undefined);
+});
+
+test('checkpoint failures never acknowledge a claim and conditional contention has a fixed retry bound', async () => {
+    for (const name of ['ConditionalCheckFailedException', 'ProvisionedThroughputExceededException']) {
+        let writes = 0;
+        const store = new DynamoStore({ async send(command) {
+            if (command.constructor.name === 'GetCommand') return {};
+            if (command.constructor.name === 'QueryCommand') return { Items: [{ packetKey: '2#first' }] };
+            writes++;
+            throw Object.assign(new Error('failed'), { name });
+        } }, tables);
+        await assert.rejects(store.claimSyncPage('node', true, 1000));
+        assert.equal(writes, name === 'ConditionalCheckFailedException' ? 5 : 1);
+    }
+});

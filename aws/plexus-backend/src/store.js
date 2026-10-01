@@ -1,5 +1,5 @@
 import { GetCommand, PutCommand, UpdateCommand, DeleteCommand, QueryCommand, TransactWriteCommand } from '@aws-sdk/lib-dynamodb';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 export const conditional = e => e?.name === 'ConditionalCheckFailedException' ||
     (e?.name === 'TransactionCanceledException' && e.CancellationReasons?.some(r => r.Code === 'ConditionalCheckFailed') &&
@@ -70,7 +70,7 @@ export class DynamoStore {
         await this.db.send(new TransactWriteCommand({ TransactItems: [
             { Update: { TableName: this.tables.vaccines, Key: { messageId: p.packetId },
                 UpdateExpression: 'SET sourceNodeId = if_not_exists(sourceNodeId, :source), recipientNodeId = if_not_exists(recipientNodeId, :dest), packetDigest = if_not_exists(packetDigest, :digest), pendingKey = if_not_exists(pendingKey, :key), createdAt = if_not_exists(createdAt, :created), expiresAt = if_not_exists(expiresAt, :expiry), #ttl = if_not_exists(#ttl, :ttl)' + (gateway ? ' ADD gatewayNodeIds :gateways' : ''),
-                ConditionExpression: 'attribute_not_exists(proof) AND (attribute_not_exists(sourceNodeId) OR (sourceNodeId = :source AND recipientNodeId = :dest)) AND (attribute_not_exists(packetDigest) OR packetDigest = :digest)' +
+                ConditionExpression: 'attribute_not_exists(proof) AND attribute_not_exists(discarded) AND (attribute_not_exists(sourceNodeId) OR (sourceNodeId = :source AND recipientNodeId = :dest)) AND (attribute_not_exists(packetDigest) OR packetDigest = :digest)' +
                     (gateway ? ' AND (attribute_not_exists(gatewayNodeIds) OR size(gatewayNodeIds) < :maxGateways OR contains(gatewayNodeIds, :uploader))' : ''),
                 ExpressionAttributeNames: { '#ttl': 'ttl' }, ExpressionAttributeValues: { ':source': item.sourceNodeId,
                     ':dest': item.destinationNodeId, ':digest': item.digest, ':key': item.packetKey, ':created': item.createdAt,
@@ -127,6 +127,34 @@ export class DynamoStore {
     async deletePushToken(node, token) {
         await this.db.send(new DeleteCommand({ TableName: this.tables.pending, Key: { destinationNodeId: node, packetKey: this.pushKey(token) } }));
     }
+    async peerBlocked(node, peer) {
+        return (await this.pending(node, `7#BLOCK#${peer}`))?.blocked === true;
+    }
+    async setPeerBlocked(node, peer, blocked, revision) {
+        try {
+            await this.db.send(new PutCommand({ TableName: this.tables.pending,
+                Item: { destinationNodeId: node, packetKey: `7#BLOCK#${peer}`, packetType: 'PEER_POLICY', blocked, revision },
+                ConditionExpression: 'attribute_not_exists(revision) OR revision <= :revision',
+                ExpressionAttributeValues: { ':revision': revision } }));
+        } catch (e) { if (!conditional(e)) throw e; }
+    }
+    async discardBlocked(item) {
+        if (item.packetType === 'MESSAGE') {
+            // Immutable discard reservation, never a delivery proof/vaccine.
+            await this.db.send(new UpdateCommand({ TableName: this.tables.vaccines, Key: { messageId: item.stableId },
+                UpdateExpression: 'SET sourceNodeId = if_not_exists(sourceNodeId, :source), recipientNodeId = if_not_exists(recipientNodeId, :dest), packetDigest = if_not_exists(packetDigest, :digest), createdAt = if_not_exists(createdAt, :created), expiresAt = if_not_exists(expiresAt, :expiry), #ttl = if_not_exists(#ttl, :ttl), discarded = :yes',
+                ConditionExpression: '(attribute_not_exists(sourceNodeId) OR (sourceNodeId = :source AND recipientNodeId = :dest)) AND (attribute_not_exists(packetDigest) OR packetDigest = :digest)',
+                ExpressionAttributeNames: { '#ttl': 'ttl' },
+                ExpressionAttributeValues: { ':yes': true, ':source': item.sourceNodeId, ':dest': item.destinationNodeId,
+                    ':digest': item.digest, ':created': item.createdAt, ':expiry': item.expiresAt, ':ttl': item.ttl } }));
+        } else if (item.packetType === 'CONNECTION_REQUEST') {
+            await this.db.send(new PutCommand({ TableName: this.tables.pending,
+                Item: { ...item, packetKey: `9#CONNECTION_REQUEST#${item.stableId}`, pendingKey: item.packetKey, blockedDiscard: true },
+                ConditionExpression: 'attribute_not_exists(packetKey) OR digest = :digest',
+                ExpressionAttributeValues: { ':digest': item.digest } }));
+        }
+        await this.deletePending(item.destinationNodeId, item.packetKey);
+    }
     async saveControl(item, markerKey) {
         const marker = { ...item, packetKey: markerKey, pendingKey: item.packetKey };
         await this.db.send(new TransactWriteCommand({ TransactItems: [
@@ -139,6 +167,41 @@ export class DynamoStore {
             KeyConditionExpression: 'destinationNodeId = :node AND packetKey < :upper',
             ExpressionAttributeValues: { ':node': node, ':upper': '3' }, ExclusiveStartKey: cursor, Limit: 20 }));
         return { items: result.Items ?? [], cursor: result.LastEvaluatedKey };
+    }
+    async messagePage(node, cursor) {
+        const result = await this.db.send(new QueryCommand({ TableName: this.tables.pending, ConsistentRead: true,
+            KeyConditionExpression: 'destinationNodeId = :node AND begins_with(packetKey, :prefix)',
+            ExpressionAttributeValues: { ':node': node, ':prefix': '2#' }, ExclusiveStartKey: cursor, Limit: 1 }));
+        return { items: result.Items ?? [], cursor: result.LastEvaluatedKey };
+    }
+    async claimSyncPage(node, messages, now, visit) {
+        const key = { destinationNodeId: node, packetKey: `6#SYNC#${messages ? 'MESSAGE' : 'ALL'}` };
+        for (let attempt = 0; attempt < 5; attempt++) {
+            const previous = await this.pending(node, key.packetKey);
+            const cursor = previous?.expiresAt > now ? previous.cursor : undefined;
+            let page = await (messages ? this.messagePage(node, cursor) : this.page(node, cursor));
+            if (messages && cursor && !page.items.length) page = await this.messagePage(node);
+            if (!previous && !page.items.length) return page;
+            // MESSAGE progress follows a successful post, one row at a time. Failed
+            // posts stay next; success is only scheduling progress, NEVER delivery ACK.
+            if (visit && !await visit(page)) return { ...page, stopped: true };
+            // The normal traversal checkpoints its completed prefix, including a
+            // partial page. Unacknowledged rows remain durable for wraparound.
+            try {
+                await this.db.send(new PutCommand({ TableName: this.tables.pending,
+                    Item: { ...key, revision: randomUUID(), ...(page.cursor ? { cursor: page.cursor } : {}),
+                        expiresAt: now + 7 * 86400000, ttl: Math.floor(now / 1000) + 7 * 86400 },
+                    ConditionExpression: previous ? 'revision = :revision' : 'attribute_not_exists(packetKey)',
+                    ...(previous ? { ExpressionAttributeValues: { ':revision': previous.revision } } : {}) }));
+                return page;
+            } catch (e) {
+                if (e.name !== 'ConditionalCheckFailedException') throw e;
+                // Another connection advanced the shared checkpoint. Do not roll it
+                // back or expand this invocation's already-posted message budget.
+                if (visit) return page;
+            }
+        }
+        throw new Error('SYNC_PROGRESS_CONTENTION');
     }
     async lockSync(id, token, now) {
         try { await this.db.send(new UpdateCommand({ TableName: this.tables.connections, Key: { connectionId: id },

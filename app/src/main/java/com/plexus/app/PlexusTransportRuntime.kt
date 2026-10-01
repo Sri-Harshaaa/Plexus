@@ -13,6 +13,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 /**
  * Owns the existing packet handlers and both live transports for one service lifetime.
@@ -25,6 +28,7 @@ internal class PlexusTransportRuntime(
 ) {
     private val coroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val contactDao = database.contactDao()
+    private val contactRelationships = ContactRelationships(database)
     private val messageDao = database.messageDao()
     private val antiPacketDao = database.antiPacketDao()
     private val connectionRequestDao = database.connectionRequestDao()
@@ -41,7 +45,15 @@ internal class PlexusTransportRuntime(
     private var networkParticipationStarted = false
     private var nearbyRetryJob: Job? = null
     private var internetRetryJob: Job? = null
-    private val pendingSyncCallbacks = mutableListOf<() -> Unit>()
+    private val pendingSyncCallbacks = linkedMapOf<String, (Boolean) -> Unit>()
+    private val proofPublicationOutbox by lazy {
+        ProofPublicationOutbox(antiPacketDao, identity.nodeId,
+            CoroutineScope(coroutineScope.coroutineContext + Dispatchers.Main.immediate)) { proof, background ->
+            PlexusDiagnostics.proofOffer("INTERNET") { internetManager.sendAntiPacket(proof, background) }
+        }
+    }
+    private val internetIngressJobs = mutableSetOf<Job>()
+    private val peerPolicyVersions = mutableMapOf<String, Pair<Boolean, Long>>()
     private var initialized = false
     private var stopping = false
     @Volatile
@@ -63,14 +75,18 @@ internal class PlexusTransportRuntime(
         contact: ContactEntity,
         messageInserted: Boolean
     ) {
-        if (!messageInserted || !shouldNotifyIncomingMessage(
-                visibleChatContactNodeId, contact.nodeId
-            )) return
-        incomingMessageNotifier.notifyConversation(
-            contact,
-            messageDao.getRecentMessagesForContact(contact.nodeId, 5).asReversed(),
-            visibleChatContactNodeId
-        )
+        if (!messageInserted) return
+        // Serialize posting with Block's Room transaction. If posting wins, Block cancels it;
+        // if Block wins, no delayed ingress job may recreate the notification.
+        database.withTransaction {
+            if (!ContactRelationshipState.canReceiveMessages(contactDao.getContactById(contact.nodeId)?.relationshipState) ||
+                !shouldNotifyIncomingMessage(visibleChatContactNodeId, contact.nodeId)) return@withTransaction
+            incomingMessageNotifier.notifyConversation(
+                contact,
+                messageDao.getRecentMessagesForContact(contact.nodeId, 5).asReversed(),
+                visibleChatContactNodeId
+            )
+        }
     }
 
     init {
@@ -100,63 +116,36 @@ internal class PlexusTransportRuntime(
                             /*
                          * nodeId is the relationship dedup key.
                          *
-                         * If we already know this identity in ANY state, an
-                         * additional request does not create or overwrite
-                         * anything.
+                         * A fresh request may restart a declined/cleared relationship.
+                         * Pinned keys and durable request IDs still prevent replacement/replay.
                          */
-                            val existingRelationship =
-                                contactDao
-                                    .getContactById(
-                                        packet.senderNodeId
-                                    )
-
-
-                            if (
-                                existingRelationship != null
-                            ) {
-
-                                Log.d(
-                                    "PlexusContact",
-                                    "$transport REQUEST IGNORED - RELATIONSHIP ALREADY EXISTS -> " +
-                                            packet.senderNodeId.take(8) +
-                                            " | state=" +
-                                            existingRelationship.relationshipState
-                                )
-
+                            if (!packet.verify()) return@requestHandler
+                            if (ContactRelationshipState.isBlocked(contactDao.getContactById(packet.senderNodeId)?.relationshipState)) {
+                                if (transport == "INTERNET") discardBlocked(packet.senderNodeId,
+                                    "1#${packet.createdAt.toString().padStart(13, '0')}#CONNECTION_REQUEST#${packet.requestId}")
                                 return@requestHandler
                             }
-
-
-                            /*
-                         * requestId gives cross-transport deduplication.
-                         *
-                         * Nearby + internet may deliver the exact same signed
-                         * request. Only the first insert wins.
-                         */
-                            val stored = database.withTransaction {
-                                connectionRequestDao.deleteExpiredRequests()
-                                // Bound unsolicited identities and commit the request + pinned row together.
-                                if (contactDao.getContactById(packet.senderNodeId) != null ||
-                                    contactDao.countIncomingPending() >= 256) return@withTransaction false
-                                if (connectionRequestDao.insertRequest(
-                                        ConnectionRequestEntity.fromPacket(packet)
-                                    ) == -1L) return@withTransaction false
-                                contactDao.insertContact(
-                                    ContactEntity(
-                                        nodeId = packet.senderNodeId,
-                                        displayName = packet.senderDisplayName,
-                                        signingPublicKey = packet.senderSigningPublicKey,
-                                        agreementPublicKey = packet.senderAgreementPublicKey,
-                                        announcedDisplayName = packet.senderDisplayName,
-                                        relationshipState = ContactRelationshipState.INCOMING_PENDING,
-                                        pendingRequestId = packet.requestId
-                                    )
-                                )
-                                true
-                            }
+                            val stored = contactRelationships.receiveRequest(packet, identity.nodeId)
                             if (!stored) {
                                 Log.d("PlexusContact", "$transport REQUEST DEFERRED - DUPLICATE OR PENDING LIMIT")
                                 return@requestHandler
+                            }
+                            if (contactDao.getContactById(packet.senderNodeId)?.relationshipState == ContactRelationshipState.CONNECTED) {
+                                try {
+                                    val response = withContext(Dispatchers.IO) {
+                                        ConnectionResponsePacket.createAccepted(packet, identity)
+                                    }
+                                    // Recheck after signing: a concurrent Block must still win.
+                                    if (contactDao.getContactById(packet.senderNodeId)?.relationshipState == ContactRelationshipState.CONNECTED) {
+                                        internetManager.sendConnectionResponse(response)
+                                        if (networkParticipationStarted) nearbyManager.sendBytesToNode(
+                                            packet.senderNodeId, response.toBytes(), NearbyManager.SendPriority.CONTROL)
+                                    }
+                                } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                                    throw cancelled
+                                } catch (_: Exception) {
+                                    Log.w("PlexusContact", "CONNECTION_RESPONSE_DEFERRED")
+                                }
                             }
 
                             Log.d(
@@ -175,194 +164,10 @@ internal class PlexusTransportRuntime(
                                 String
                             ) -> Unit =
                         responseHandler@ { packet, transport ->
-
-
-                            if (
-                                packet.requesterNodeId !=
-                                identity.nodeId
-                            ) {
-
-                                Log.e(
-                                    "PlexusContact",
-                                    "$transport RESPONSE REJECTED - WRONG REQUESTER -> " +
-                                            packet.requesterNodeId.take(8)
-                                )
-
-                                return@responseHandler
-                            }
-
-
-                            val originalRequest =
-                                connectionRequestDao
-                                    .getRequestById(
-                                        packet.requestId
-                                    )
-                                    ?: run {
-
-                                        Log.d(
-                                            "PlexusContact",
-                                            "$transport RESPONSE IGNORED - REQUEST NOT PENDING -> " +
-                                                    packet.requestId.take(8)
-                                        )
-
-                                        return@responseHandler
-                                    }
-
-
-                            /*
-                         * Bind this response to the exact outgoing request.
-                         */
-                            if (
-                                originalRequest.senderNodeId !=
-                                identity.nodeId ||
-                                originalRequest.recipientNodeId !=
-                                packet.responderNodeId
-                            ) {
-
-                                Log.e(
-                                    "PlexusContact",
-                                    "$transport RESPONSE REJECTED - REQUEST CORRELATION FAILED -> " +
-                                            packet.requestId.take(8)
-                                )
-
-                                return@responseHandler
-                            }
-
-
-                            val relationship =
-                                contactDao
-                                    .getContactById(
-                                        packet.responderNodeId
-                                    )
-                                    ?: run {
-
-                                        Log.e(
-                                            "PlexusContact",
-                                            "$transport RESPONSE REJECTED - NO PENDING RELATIONSHIP -> " +
-                                                    packet.responderNodeId.take(8)
-                                        )
-
-                                        return@responseHandler
-                                    }
-
-
-                            if (
-                                relationship.relationshipState !=
-                                ContactRelationshipState.OUTGOING_PENDING ||
-                                relationship.pendingRequestId !=
-                                packet.requestId
-                            ) {
-
-                                Log.d(
-                                    "PlexusContact",
-                                    "$transport RESPONSE IGNORED - RELATIONSHIP NO LONGER PENDING -> " +
-                                            packet.responderNodeId.take(8)
-                                )
-
-                                return@responseHandler
-                            }
-
-
-                            /*
-                         * The QR/link we scanned pinned the responder's keys.
-                         *
-                         * A signed response from a DIFFERENT valid Plexus
-                         * identity must not be allowed to replace those keys.
-                         */
-                            if (
-                                relationship.signingPublicKey !=
-                                packet.responderSigningPublicKey ||
-                                relationship.agreementPublicKey !=
-                                packet.responderAgreementPublicKey
-                            ) {
-
-                                Log.e(
-                                    "PlexusContact",
-                                    "$transport RESPONSE REJECTED - PINNED KEY MISMATCH -> " +
-                                            packet.responderNodeId.take(8)
-                                )
-
-                                return@responseHandler
-                            }
-
-
-                            if (
-                                packet.isAccepted()
-                            ) {
-
-
-                                contactDao
-                                    .updateAnnouncedDisplayName(
-
-                                        nodeId =
-                                            packet.responderNodeId,
-
-                                        announcedDisplayName =
-                                            packet.responderDisplayName
-                                    )
-
-
-                                /*
-                             * Acceptance establishes trust immediately.
-                             *
-                             * We still keep the chat hidden until this user
-                             * confirms their LOCAL saved name.
-                             */
-                                contactDao
-                                    .updateRelationshipState(
-
-                                        nodeId =
-                                            packet.responderNodeId,
-
-                                        relationshipState =
-                                            ContactRelationshipState
-                                                .ACCEPTED_NEEDS_NAME,
-
-                                        pendingRequestId =
-                                            null
-                                    )
-
-
-                                /*
-                             * Response was processed successfully, so this
-                             * outgoing request no longer needs retrying.
-                             */
-                                connectionRequestDao
-                                    .deleteRequest(
-                                        packet.requestId
-                                    )
-
-
-                                Log.d(
-                                    "PlexusContact",
-                                    "$transport CONNECTION ACCEPTED ✅ -> " +
-                                            packet.responderNodeId.take(8)
-                                )
-
-
-                            } else if (
-                                packet.isDeclined()
-                            ) {
-
-
-                                contactDao
-                                    .markDeclined(
-                                        packet.responderNodeId
-                                    )
-
-
-                                connectionRequestDao
-                                    .deleteRequest(
-                                        packet.requestId
-                                    )
-
-
-                                Log.d(
-                                    "PlexusContact",
-                                    "$transport CONNECTION DECLINED -> " +
-                                            packet.responderNodeId.take(8)
-                                )
-                            }
+                            val processed = contactRelationships.receiveResponse(packet, identity.nodeId)
+                            Log.d("PlexusContact", if (processed) {
+                                if (packet.isAccepted()) "CONNECTION_ACCEPTED" else "CONNECTION_DECLINED"
+                            } else "CONNECTION_RESPONSE_IGNORED")
                         }
 
 
@@ -455,6 +260,7 @@ internal class PlexusTransportRuntime(
 
 
                                         override fun onAuthenticated() {
+                                            proofPublicationOutbox.connected()
 
                                             Log.d(
                                                 "PlexusInternet",
@@ -464,10 +270,12 @@ internal class PlexusTransportRuntime(
                                             PlexusPushToken.get(context)?.let {
                                                 internetManagerHolder[0]?.registerPushToken(it)
                                             }
+                                            refreshPeerPolicy()
                                             onRetryPending()
                                         }
 
                                         override fun onRetryPending() {
+                                            proofPublicationOutbox.retryPending()
                                             if (internetSyncJob[0]?.isActive == true) return
 
 
@@ -538,6 +346,7 @@ internal class PlexusTransportRuntime(
 
                                                         if (!networkParticipationStarted &&
                                                             meshPacket.sourceNodeId != identity.nodeId) continue
+                                                        PlexusDiagnostics.message("PENDING_INTERNET_RETRY", meshPacket.packetId)
 
 
                                                         /*
@@ -553,7 +362,7 @@ internal class PlexusTransportRuntime(
                                                             antiPacketStore
                                                                 .hasActiveVaccineFor(
                                                                     meshPacket
-                                                                )
+                                                                ).also { found -> PlexusDiagnostics.message("VACCINE_FOUND_FOR_PENDING", meshPacket.packetId, "found=$found") }
                                                         ) {
 
                                                             meshRelayStore
@@ -705,7 +514,8 @@ internal class PlexusTransportRuntime(
                                                                                 relationship.relationshipState ==
                                                                                         ContactRelationshipState.CONNECTED ||
                                                                                         relationship.relationshipState ==
-                                                                                        ContactRelationshipState.DECLINED
+                                                                                        ContactRelationshipState.DECLINED ||
+                                                                                        ContactRelationshipState.isBlocked(relationship.relationshipState)
                                                                                 )
                                                             }
 
@@ -815,60 +625,6 @@ internal class PlexusTransportRuntime(
                                                     }
 
 
-                                                    val localDeliveryAntiPackets =
-                                                        antiPacketStore
-                                                            .getPropagationCandidates()
-                                                            .filter { antiPacket ->
-
-                                                                antiPacket.recipientNodeId ==
-                                                                        identity.nodeId
-                                                            }
-
-
-                                                    var uploadedCount =
-                                                        0
-
-
-                                                    for (
-                                                    antiPacket in
-                                                    localDeliveryAntiPackets
-                                                    ) {
-                                                        delay(75L)
-
-
-                                                        val sent =
-                                                            internetManagerHolder[
-                                                                0
-                                                            ]
-                                                                ?.sendAntiPacket(
-                                                                    antiPacket,
-                                                                    background = true
-                                                                )
-                                                                ?: false
-
-
-                                                        if (
-                                                            sent
-                                                        ) {
-
-                                                            uploadedCount +=
-                                                                1
-                                                        } else {
-                                                            break
-                                                        }
-                                                    }
-
-
-                                                    if (
-                                                        uploadedCount > 0
-                                                    ) {
-
-                                                        Log.d(
-                                                            "PlexusInternet",
-                                                            "LOCAL DELIVERY ANTI-PACKETS SYNCED 💉🌐 -> " +
-                                                                    uploadedCount
-                                                        )
-                                                    }
 
 
                                                 } catch (
@@ -886,14 +642,28 @@ internal class PlexusTransportRuntime(
                                         }
 
                                         override fun onSyncComplete(busy: Boolean) {
-                                            if (busy) return
-                                            val callbacks = pendingSyncCallbacks.toList()
-                                            pendingSyncCallbacks.clear()
-                                            callbacks.forEach { it() }
+                                            if (busy) { internetManager.retryPending(); return }
+                                            val callbacks = pendingSyncCallbacks.toMap()
+                                            val ingress = internetIngressJobs.toList()
+                                            coroutineScope.launch(Dispatchers.Main.immediate) {
+                                                ingress.forEach { it.join() }
+                                                val published = if (callbacks.isEmpty()) true else proofPublicationOutbox.flush()
+                                                Log.d("PlexusSync", "PENDING_SYNC_COMPLETE proofsPublished=$published")
+                                                callbacks.forEach { (id, callback) ->
+                                                    if (pendingSyncCallbacks.remove(id) != null) callback(published)
+                                                }
+                                            }
                                         }
 
 
+                                        override fun onAntiPacketAcknowledged(packet: NearbyAntiPacket) {
+                                            coroutineScope.launch(Dispatchers.Main.immediate) {
+                                                proofPublicationOutbox.acknowledge(packet)
+                                            }
+                                        }
+
                                         override fun onDisconnected() {
+                                            proofPublicationOutbox.disconnected()
                                             internetSyncJob[0]?.cancel()
 
 
@@ -925,6 +695,7 @@ internal class PlexusTransportRuntime(
                                         override fun onMeshPacketReceived(
                                             packet: NearbyMeshPacket
                                         ) {
+                                            Log.d("PlexusSync", "PENDING_MESSAGE_RECEIVED")
 
 
                                             if (
@@ -932,7 +703,7 @@ internal class PlexusTransportRuntime(
                                             ) {
 
 
-                                                coroutineScope.launch(Dispatchers.Main.immediate) {
+                                                launchInternetIngress launch@ {
 
                                                     meshRelayStore
                                                         .cleanupExpired()
@@ -968,7 +739,7 @@ internal class PlexusTransportRuntime(
                                             }
 
 
-                                            coroutineScope.launch(Dispatchers.Main.immediate) {
+                                            launchInternetIngress launch@ {
 
 
                                                 try {
@@ -994,7 +765,7 @@ internal class PlexusTransportRuntime(
 
                                                         antiPacketDao.getAntiPacket(packet.packetId)
                                                             ?.toNearbyAntiPacket()
-                                                            ?.let { internetManagerHolder[0]?.sendAntiPacket(it) }
+                                                            ?.let { proofPublicationOutbox.offerFresh(it) }
                                                         Log.d(
                                                             "PlexusInternet",
                                                             "INTERNET PACKET KILLED BY VACCINE 💉 -> " +
@@ -1033,15 +804,12 @@ internal class PlexusTransportRuntime(
                                                     }
 
 
-                                                    val knownContact =
-                                                        contactsHolder[
-                                                            0
-                                                        ]
-                                                            .firstOrNull { contact ->
-
-                                                                contact.nodeId ==
-                                                                        encryptedPacket.senderNodeId
-                                                            }
+                                                    val relationship = contactDao.getContactById(encryptedPacket.senderNodeId)
+                                                    if (ContactRelationshipState.isBlocked(relationship?.relationshipState)) {
+                                                        discardBlockedMessage(packet)
+                                                        return@launch
+                                                    }
+                                                    val knownContact = relationship?.takeIf { ContactRelationshipState.canReceiveMessages(it.relationshipState) }
 
 
                                                     if (
@@ -1154,7 +922,7 @@ internal class PlexusTransportRuntime(
                                                             ?: try {
 
 
-                                                                PlexusCrypto
+                                                                PlexusDiagnostics.timed("KEY_DERIVATION", "sessionKey") { PlexusCrypto
                                                                     .deriveSessionKey(
 
                                                                         localAgreementPublicKey =
@@ -1170,7 +938,7 @@ internal class PlexusTransportRuntime(
 
                                                                         remoteNodeId =
                                                                             knownContact.nodeId
-                                                                    )
+                                                                    ) }
                                                                     .also { derivedKey ->
 
                                                                         peerEncryptionKeys[
@@ -1198,11 +966,11 @@ internal class PlexusTransportRuntime(
 
 
                                                     val plaintext =
-                                                        encryptedPacket
+                                                        PlexusDiagnostics.timed("DECRYPT", "encryptedChat") { encryptedPacket
                                                             .decrypt(
                                                                 sessionKey =
                                                                     sessionKey
-                                                            )
+                                                            ) }
 
 
                                                     if (
@@ -1299,16 +1067,8 @@ internal class PlexusTransportRuntime(
                                                         /*
                                                      * Store visible chat first, acknowledge second.
                                                      */
-                                                        val messageInserted = messageDao
-                                                            .insertMessage(
-                                                                incomingMessage
-                                                            ) != -1L
-
-
-                                                        conversationStateDao
-                                                            .unhideConversation(
-                                                                encryptedPacket.senderNodeId
-                                                            )
+                                                        val messageInserted = contactRelationships.persistIncoming(incomingMessage)
+                                                        if (messageInserted == null) return@launch
 
                                                         notifyIncomingMessageIfNeeded(
                                                             knownContact,
@@ -1339,7 +1099,7 @@ internal class PlexusTransportRuntime(
 
                                                                     recipientIdentity =
                                                                         identity
-                                                                )
+                                                                ).also { PlexusDiagnostics.message("DELIVERY_PROOF_GENERATED", it.messageId) }
 
 
                                                         } catch (
@@ -1385,25 +1145,19 @@ internal class PlexusTransportRuntime(
                                                              * - internet: server may delete queue
                                                              * - Nearby: peers may delete relay copies
                                                              */
-                                                                internetManagerHolder[
-                                                                    0
-                                                                ]
-                                                                    ?.sendAntiPacket(
-                                                                        deliveryAntiPacket
-                                                                    )
+                                                                proofPublicationOutbox.offerFresh(deliveryAntiPacket)
 
 
                                                                 if (networkParticipationStarted) {
-                                                                    nearbyManagerHolder[0]?.broadcastBytes(
+                                                                    PlexusDiagnostics.proofOffer("NEARBY", deliveryAntiPacket.messageId) { nearbyManagerHolder[0]?.broadcastBytes(
                                                                         deliveryAntiPacket.toBytes()
-                                                                    )
+                                                                    ) }
                                                                 }
 
 
                                                                 Log.d(
                                                                     "PlexusInternet",
-                                                                    "DELIVERY ANTI-PACKET SENT 💉✅🌐 -> " +
-                                                                            encryptedPacket.messageId.take(8)
+                                                                    "DELIVERY_PROOF_SENT"
                                                                 )
                                                             }
 
@@ -1472,7 +1226,7 @@ internal class PlexusTransportRuntime(
                                         ) {
 
 
-                                            coroutineScope.launch(Dispatchers.Main.immediate) {
+                                            launchInternetIngress launch@ {
 
 
                                                 try {
@@ -1492,11 +1246,11 @@ internal class PlexusTransportRuntime(
                                                             nearbyManagerHolder[0]?.discardAcknowledged(packet)
 
 
-                                                            messageDao
+                                                            PlexusDiagnostics.room("markMessageDelivered") { messageDao
                                                                 .markMessageDelivered(
                                                                     packet.messageId,
                                                                     packet.recipientNodeId
-                                                                )
+                                                                ).also { rows -> PlexusDiagnostics.message("MARK_MESSAGE_DELIVERED", packet.messageId, "rowsUpdated=$rows") } }
 
 
                                                             /*
@@ -1507,7 +1261,7 @@ internal class PlexusTransportRuntime(
                                                          * rebroadcast when they come back.
                                                          */
                                                             if (networkParticipationStarted) {
-                                                                nearbyManagerHolder[0]?.broadcastBytes(packet.toBytes())
+                                                                PlexusDiagnostics.proofOffer("NEARBY", packet.messageId) { nearbyManagerHolder[0]?.broadcastBytes(packet.toBytes()) }
                                                             }
 
 
@@ -1525,11 +1279,11 @@ internal class PlexusTransportRuntime(
                                                             nearbyManagerHolder[0]?.discardAcknowledged(packet)
 
 
-                                                            messageDao
+                                                            PlexusDiagnostics.room("markMessageDelivered") { messageDao
                                                                 .markMessageDelivered(
                                                                     packet.messageId,
                                                                     packet.recipientNodeId
-                                                                )
+                                                                ).also { rows -> PlexusDiagnostics.message("MARK_MESSAGE_DELIVERED", packet.messageId, "rowsUpdated=$rows") } }
 
 
                                                             Log.d(
@@ -1589,7 +1343,7 @@ internal class PlexusTransportRuntime(
                                         ) {
 
 
-                                            coroutineScope.launch(Dispatchers.Main.immediate) {
+                                            launchInternetIngress launch@ {
 
                                                 handleIncomingConnectionRequest(
                                                     packet,
@@ -1609,7 +1363,7 @@ internal class PlexusTransportRuntime(
                                         ) {
 
 
-                                            coroutineScope.launch(Dispatchers.Main.immediate) {
+                                            launchInternetIngress launch@ {
 
                                                 handleIncomingConnectionResponse(
                                                     packet,
@@ -1623,6 +1377,8 @@ internal class PlexusTransportRuntime(
                                             message: String,
                                             exception: Exception?
                                         ) {
+                                            if (message == "STALE_SYNC_RECOVERY" || message == "STALE_SOCKET_RECOVERY") return
+
 
                                             if (
                                                 isTerminalPacketRejection(
@@ -1868,10 +1624,10 @@ internal class PlexusTransportRuntime(
                                          * sender's node/key binding, signature and lifetime.
                                          */
                                             val connectionRequestPacket =
-                                                ConnectionRequestPacket
+                                                PlexusDiagnostics.timed("PARSE", "ConnectionRequestPacket") { ConnectionRequestPacket
                                                     .fromBytes(
                                                         bytes
-                                                    )
+                                                    ) }
 
 
                                             if (
@@ -1888,7 +1644,7 @@ internal class PlexusTransportRuntime(
                                                 }
 
 
-                                                coroutineScope.launch(Dispatchers.Main.immediate) {
+                                                PlexusDiagnostics.launch(coroutineScope) {
 
                                                     handleIncomingConnectionRequest(
                                                         connectionRequestPacket,
@@ -1907,10 +1663,10 @@ internal class PlexusTransportRuntime(
                                          * =================================================
                                          */
                                             val connectionResponsePacket =
-                                                ConnectionResponsePacket
+                                                PlexusDiagnostics.timed("PARSE", "ConnectionResponsePacket") { ConnectionResponsePacket
                                                     .fromBytes(
                                                         bytes
-                                                    )
+                                                    ) }
 
 
                                             if (
@@ -1927,7 +1683,7 @@ internal class PlexusTransportRuntime(
                                                 }
 
 
-                                                coroutineScope.launch(Dispatchers.Main.immediate) {
+                                                PlexusDiagnostics.launch(coroutineScope) {
 
                                                     handleIncomingConnectionResponse(
                                                         connectionResponsePacket,
@@ -1955,10 +1711,10 @@ internal class PlexusTransportRuntime(
                                          */
 
                                             val identityPacket =
-                                                NearbyIdentityPacket
+                                                PlexusDiagnostics.timed("PARSE", "NearbyIdentityPacket") { NearbyIdentityPacket
                                                     .fromBytes(
                                                         bytes
-                                                    )
+                                                    ) }
 
 
                                             if (
@@ -2160,10 +1916,10 @@ internal class PlexusTransportRuntime(
                                          */
 
                                             val authPacket =
-                                                NearbyAuthPacket
+                                                PlexusDiagnostics.timed("PARSE", "NearbyAuthPacket") { NearbyAuthPacket
                                                     .fromBytes(
                                                         bytes
-                                                    )
+                                                    ) }
 
 
                                             if (
@@ -2432,7 +2188,7 @@ internal class PlexusTransportRuntime(
 
 
                                                                     val sessionKey =
-                                                                        PlexusCrypto
+                                                                        PlexusDiagnostics.timed("KEY_DERIVATION", "sessionKey") { PlexusCrypto
                                                                             .deriveSessionKey(
 
                                                                                 localAgreementPublicKey =
@@ -2448,7 +2204,7 @@ internal class PlexusTransportRuntime(
 
                                                                                 remoteNodeId =
                                                                                     knownContact.nodeId
-                                                                            )
+                                                                            ) }
 
 
                                                                     peerEncryptionKeys[
@@ -2515,7 +2271,7 @@ internal class PlexusTransportRuntime(
                                                          * will handle deletion in the next
                                                          * protocol stage.
                                                          */
-                                                            coroutineScope.launch(Dispatchers.Main.immediate) {
+                                                            PlexusDiagnostics.launch(coroutineScope) {
 
 
                                                                 try {
@@ -2603,7 +2359,8 @@ internal class PlexusTransportRuntime(
                                                                                                 relationship.relationshipState ==
                                                                                                         ContactRelationshipState.CONNECTED ||
                                                                                                         relationship.relationshipState ==
-                                                                                                        ContactRelationshipState.DECLINED
+                                                                                                        ContactRelationshipState.DECLINED ||
+                                                                                                        ContactRelationshipState.isBlocked(relationship.relationshipState)
                                                                                                 )
                                                                             }
 
@@ -2765,15 +2522,16 @@ internal class PlexusTransportRuntime(
                                          */
 
                                             val antiPacket =
-                                                NearbyAntiPacket
+                                                PlexusDiagnostics.timed("PARSE", "NearbyAntiPacket") { NearbyAntiPacket
                                                     .fromBytes(
                                                         bytes
-                                                    )
+                                                    ) }
 
 
                                             if (
                                                 antiPacket != null
                                             ) {
+                                                PlexusDiagnostics.message("DELIVERY_PROOF_RECEIVED", antiPacket.messageId, "source=NEARBY")
 
 
                                                 val manager =
@@ -2823,7 +2581,7 @@ internal class PlexusTransportRuntime(
                                                 }
 
 
-                                                coroutineScope.launch(Dispatchers.Main.immediate) {
+                                                PlexusDiagnostics.launch(coroutineScope) {
 
 
                                                     try {
@@ -2843,11 +2601,11 @@ internal class PlexusTransportRuntime(
                                                                 nearbyManagerHolder[0]?.discardAcknowledged(antiPacket)
 
 
-                                                                messageDao
+                                                                PlexusDiagnostics.room("markMessageDelivered") { messageDao
                                                                     .markMessageDelivered(
                                                                         antiPacket.messageId,
                                                                         antiPacket.recipientNodeId
-                                                                    )
+                                                                    ).also { rows -> PlexusDiagnostics.message("MARK_MESSAGE_DELIVERED", antiPacket.messageId, "rowsUpdated=$rows") } }
 
 
                                                                 Log.d(
@@ -2867,11 +2625,11 @@ internal class PlexusTransportRuntime(
                                                              * are not rebroadcast, preventing a
                                                              * vaccine loop.
                                                              */
-                                                                manager
+                                                                PlexusDiagnostics.proofOffer("NEARBY", antiPacket.messageId) { manager
                                                                     .broadcastBytes(
                                                                         antiPacket
                                                                             .toBytes()
-                                                                    )
+                                                                    ) }
                                                             }
 
 
@@ -2881,11 +2639,11 @@ internal class PlexusTransportRuntime(
                                                                 nearbyManagerHolder[0]?.discardAcknowledged(antiPacket)
 
 
-                                                                messageDao
+                                                                PlexusDiagnostics.room("markMessageDelivered") { messageDao
                                                                     .markMessageDelivered(
                                                                         antiPacket.messageId,
                                                                         antiPacket.recipientNodeId
-                                                                    )
+                                                                    ).also { rows -> PlexusDiagnostics.message("MARK_MESSAGE_DELIVERED", antiPacket.messageId, "rowsUpdated=$rows") } }
 
 
                                                                 Log.d(
@@ -2958,15 +2716,16 @@ internal class PlexusTransportRuntime(
                                          */
 
                                             val meshPacket =
-                                                NearbyMeshPacket
+                                                PlexusDiagnostics.timed("PARSE", "NearbyMeshPacket") { NearbyMeshPacket
                                                     .fromBytes(
                                                         bytes
-                                                    )
+                                                    ) }
 
 
                                             if (
                                                 meshPacket != null
                                             ) {
+                                                PlexusDiagnostics.message("RECEIVER_PACKET_INGRESS", meshPacket.packetId, "source=NEARBY")
 
 
                                                 val manager =
@@ -3021,7 +2780,7 @@ internal class PlexusTransportRuntime(
                                                 ) {
 
 
-                                                    coroutineScope.launch(Dispatchers.Main.immediate) {
+                                                    PlexusDiagnostics.launch(coroutineScope) {
 
                                                         meshRelayStore
                                                             .cleanupExpired()
@@ -3047,7 +2806,7 @@ internal class PlexusTransportRuntime(
                                              * this coroutine instead of blocking Nearby's
                                              * callback thread.
                                              */
-                                                coroutineScope.launch(Dispatchers.Main.immediate) {
+                                                PlexusDiagnostics.launch(coroutineScope) {
 
 
                                                     try {
@@ -3076,8 +2835,8 @@ internal class PlexusTransportRuntime(
                                                             antiPacketDao.getAntiPacket(meshPacket.packetId)
                                                                 ?.toNearbyAntiPacket()
                                                                 ?.let { proof ->
-                                                                    manager.sendBytesToNode(immediatePeerNodeId, proof.toBytes(),
-                                                                        NearbyManager.SendPriority.MESSAGE)
+                                                                    PlexusDiagnostics.proofOffer("NEARBY", proof.messageId) { manager.sendBytesToNode(immediatePeerNodeId, proof.toBytes(),
+                                                                        NearbyManager.SendPriority.MESSAGE) }
                                                                 }
                                                             Log.d(
                                                                 "PlexusNearby",
@@ -3131,15 +2890,12 @@ internal class PlexusTransportRuntime(
                                                             }
 
 
-                                                            val knownContact =
-                                                                contactsHolder[
-                                                                    0
-                                                                ]
-                                                                    .firstOrNull { contact ->
-
-                                                                        contact.nodeId ==
-                                                                                encryptedPacket.senderNodeId
-                                                                    }
+                                                            val relationship = contactDao.getContactById(encryptedPacket.senderNodeId)
+                                                    if (ContactRelationshipState.isBlocked(relationship?.relationshipState)) {
+                                                        discardBlockedMessage(meshPacket)
+                                                        return@launch
+                                                    }
+                                                    val knownContact = relationship?.takeIf { ContactRelationshipState.canReceiveMessages(it.relationshipState) }
 
 
                                                             if (
@@ -3249,7 +3005,7 @@ internal class PlexusTransportRuntime(
                                                                     ?: try {
 
 
-                                                                        PlexusCrypto
+                                                                        PlexusDiagnostics.timed("KEY_DERIVATION", "sessionKey") { PlexusCrypto
                                                                             .deriveSessionKey(
 
                                                                                 localAgreementPublicKey =
@@ -3265,7 +3021,7 @@ internal class PlexusTransportRuntime(
 
                                                                                 remoteNodeId =
                                                                                     knownContact.nodeId
-                                                                            )
+                                                                            ) }
                                                                             .also { derivedKey ->
 
                                                                                 peerEncryptionKeys[
@@ -3293,11 +3049,11 @@ internal class PlexusTransportRuntime(
 
 
                                                             val plaintext =
-                                                                encryptedPacket
+                                                                PlexusDiagnostics.timed("DECRYPT", "encryptedChat") { encryptedPacket
                                                                     .decrypt(
                                                                         sessionKey =
                                                                             sessionKey
-                                                                    )
+                                                                    ) }
 
 
                                                             if (
@@ -3400,16 +3156,8 @@ internal class PlexusTransportRuntime(
                                                                 /*
                                                              * Store visible chat first, acknowledge second.
                                                              */
-                                                                val messageInserted = messageDao
-                                                                    .insertMessage(
-                                                                        incomingMessage
-                                                                    ) != -1L
-
-
-                                                                conversationStateDao
-                                                                    .unhideConversation(
-                                                                        encryptedPacket.senderNodeId
-                                                                    )
+                                                                val messageInserted = contactRelationships.persistIncoming(incomingMessage)
+                                                                if (messageInserted == null) return@launch
 
                                                                 notifyIncomingMessageIfNeeded(
                                                                     knownContact,
@@ -3445,7 +3193,7 @@ internal class PlexusTransportRuntime(
 
                                                                             recipientIdentity =
                                                                                 identity
-                                                                        )
+                                                                        ).also { PlexusDiagnostics.message("DELIVERY_PROOF_GENERATED", it.messageId) }
 
 
                                                                 } catch (
@@ -3492,12 +3240,12 @@ internal class PlexusTransportRuntime(
                                                                      * will drop the duplicate and
                                                                      * will not rebroadcast it.
                                                                      */
-                                                                        manager
+                                                                        PlexusDiagnostics.proofOffer("NEARBY", deliveryAntiPacket.messageId) { manager
                                                                             .broadcastBytes(
                                                                                 bytes = deliveryAntiPacket
                                                                                     .toBytes(),
                                                                                 priority = NearbyManager.SendPriority.MESSAGE
-                                                                            )
+                                                                            ) }
 
 
                                                                         /*
@@ -3510,12 +3258,7 @@ internal class PlexusTransportRuntime(
                                                                      * copy instead of resurrecting an already-delivered
                                                                      * message later.
                                                                      */
-                                                                        internetManagerHolder[
-                                                                            0
-                                                                        ]
-                                                                            ?.sendAntiPacket(
-                                                                                deliveryAntiPacket
-                                                                            )
+                                                                        proofPublicationOutbox.offerFresh(deliveryAntiPacket)
 
 
                                                                         Log.d(
@@ -3724,6 +3467,7 @@ internal class PlexusTransportRuntime(
 
     fun startPersonalMessaging(onStarted: () -> Unit, onFailed: (Throwable) -> Unit) {
         requireMainThread()
+        PlexusDiagnostics.printBuildOnce()
         if (started || stopping) return
         started = true
         coroutineScope.launch(Dispatchers.Main.immediate) {
@@ -3745,6 +3489,7 @@ internal class PlexusTransportRuntime(
                     while (true) {
                         delay(30_000L)
                         if (!internetManager.isAuthenticated()) continue
+                        refreshPeerPolicy()
                         try {
                             internetManager.retryPending()
                         } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -3765,10 +3510,79 @@ internal class PlexusTransportRuntime(
 
     private fun updateRelationships(relationships: List<ContactEntity>) {
         relationshipsHolder[0] = relationships
+        if (initialized) refreshPeerPolicy()
         contactsHolder[0] = relationships.filter {
             it.relationshipState == ContactRelationshipState.CONNECTED ||
                 it.relationshipState == ContactRelationshipState.ACCEPTED_NEEDS_NAME
         }
+    }
+
+    private fun launchInternetIngress(block: suspend CoroutineScope.() -> Unit) {
+        val job = PlexusDiagnostics.launch(coroutineScope, source = "INTERNET", block = block)
+        internetIngressJobs.add(job)
+        job.invokeOnCompletion { internetIngressJobs.remove(job) }
+    }
+
+    fun cancelPersonalSync(requestId: String) { requireMainThread(); pendingSyncCallbacks.remove(requestId) }
+    fun wakeForSync() { requireMainThread(); if (initialized && !stopping) internetManager.wakeForSync() }
+
+    private var peerPolicyJob: Job? = null
+    private val peerPolicyRevisionMutex = Mutex()
+    private suspend fun nextPeerPolicyRevision(): Long = peerPolicyRevisionMutex.withLock {
+        withContext(Dispatchers.IO) {
+            val prefs = context.getSharedPreferences("plexus_peer_policy", Context.MODE_PRIVATE)
+            val revision = maxOf(System.currentTimeMillis(), prefs.getLong("revision", 0) + 1)
+            check(prefs.edit().putLong("revision", revision).commit())
+            revision
+        }
+    }
+    fun refreshPeerPolicy() {
+        requireMainThread()
+        if (!initialized || stopping) return
+        peerPolicyJob?.cancel()
+        peerPolicyJob = coroutineScope.launch(Dispatchers.Main.immediate) {
+            try {
+            // Every known relationship is authoritative, even if NONE already became
+            // OUTGOING_PENDING before a process restart could upload its unblock.
+            for (contact in contactDao.getAllRelationships().first().sortedBy { it.relationshipState == ContactRelationshipState.CONNECTED }) {
+                val blocked = ContactRelationshipState.isBlocked(contact.relationshipState)
+                val previous = peerPolicyVersions[contact.nodeId]
+                val version = if (previous?.first == blocked) previous else {
+                    (blocked to nextPeerPolicyRevision()).also { peerPolicyVersions[contact.nodeId] = it }
+                }
+                if ((ContactRelationshipState.isBlocked(contactDao.getContactById(contact.nodeId)?.relationshipState)) != blocked) continue
+                internetManager.setPeerBlocked(contact.nodeId, blocked, version.second,
+                    background = !blocked && previous == null && contact.relationshipState == ContactRelationshipState.CONNECTED)
+            }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                Log.w("PlexusInternet", "PEER_POLICY_RETRY_DEFERRED")
+            }
+        }
+    }
+
+    private fun discardBlocked(peer: String, key: String) {
+        coroutineScope.launch(Dispatchers.Main.immediate) {
+            try {
+            if (!ContactRelationshipState.isBlocked(contactDao.getContactById(peer)?.relationshipState)) return@launch
+            val revision = nextPeerPolicyRevision()
+            if (!ContactRelationshipState.isBlocked(contactDao.getContactById(peer)?.relationshipState)) return@launch
+            peerPolicyVersions[peer] = true to revision
+            // Same authenticated session serializes the policy update before its discard offer.
+            internetManager.setPeerBlocked(peer, true, revision)
+            internetManager.discardBlockedPacket(key, peer)
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                Log.w("PlexusInternet", "BLOCK_DISCARD_RETRY_DEFERRED")
+            }
+        }
+    }
+
+    private fun discardBlockedMessage(packet: NearbyMeshPacket) {
+        discardBlocked(packet.sourceNodeId,
+            "2#${packet.createdAt.toString().padStart(13, '0')}#MESSAGE#${packet.packetId}")
     }
 
     fun startNearbyIfPermitted() {
@@ -3782,6 +3596,7 @@ internal class PlexusTransportRuntime(
         requireMainThread()
         if (!initialized || stopping || networkParticipationStarted) return
         networkParticipationStarted = true
+        PlexusDiagnostics.start(coroutineScope) { nearbyManager.diagnosticSnapshot() }
         startNearbyIfPermitted()
         nearbyRetryJob = coroutineScope.launch(Dispatchers.Main.immediate) {
             while (true) {
@@ -3801,6 +3616,8 @@ internal class PlexusTransportRuntime(
         requireMainThread()
         if (!networkParticipationStarted) return
         networkParticipationStarted = false
+        PlexusDiagnostics.stop()
+        internetManager.stopGatewayOffers()
         nearbyRetryJob?.cancel()
         nearbyRetryJob = null
         nearbyManager.stopEverything()
@@ -3818,10 +3635,12 @@ internal class PlexusTransportRuntime(
         if (initialized && !stopping) internetManager.retryPending()
     }
 
-    fun syncPersonalPending(onComplete: () -> Unit) {
+    fun syncPersonalPending(requestId: String, onComplete: (Boolean) -> Unit) {
         requireMainThread()
         if (!initialized || stopping) return
-        pendingSyncCallbacks += onComplete
+        pendingSyncCallbacks[requestId] = onComplete
+        Log.d("PlexusSync", "PENDING_SYNC_REQUESTED")
+        internetManager.wakeForSync()
         internetManager.retryPending()
     }
 
@@ -3859,11 +3678,13 @@ internal class PlexusTransportRuntime(
         requireMainThread()
         if (stopping) return
         stopping = true
+        PlexusDiagnostics.stop()
         initialized = false
         networkParticipationStarted = false
         internetSyncJob[0]?.cancel()
         nearbyRetryJob?.cancel()
         internetRetryJob?.cancel()
+        pendingSyncCallbacks.clear()
         coroutineScope.cancel()
         try {
             nearbyManager.stopEverything()

@@ -228,4 +228,7 @@ interface RelayPacketDao {
         """
     )
     suspend fun deleteAllPackets(): Int
+
+    @Query("DELETE FROM relay_packets WHERE sourceNodeId = :localNodeId AND destinationNodeId = :peerNodeId")
+    suspend fun deleteOwnPacketsForPeer(localNodeId: String, peerNodeId: String): Int
 }

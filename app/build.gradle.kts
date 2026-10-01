@@ -1,4 +1,5 @@
 import java.util.Properties
+import java.security.MessageDigest
 import org.gradle.api.DefaultTask
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.Input
@@ -32,6 +33,21 @@ val releaseKeyAlias = providers.gradleProperty("PLEXUS_RELEASE_KEY_ALIAS")
 val releaseKeyPassword = providers.gradleProperty("PLEXUS_RELEASE_KEY_PASSWORD")
 val hasReleaseSigning = listOf(releaseStoreFile, releaseStorePassword, releaseKeyAlias, releaseKeyPassword).all { it.isPresent }
 
+// Include uncommitted production source/resources; never read credential or local configuration files.
+val diagnosticRevision = providers.exec {
+    workingDir(rootProject.projectDir)
+    commandLine("git", "rev-parse", "--short=12", "HEAD")
+}.standardOutput.asText.get().trim()
+val diagnosticDigest = MessageDigest.getInstance("SHA-256")
+val diagnosticInputs = fileTree("src/main").files + file("build.gradle.kts") +
+    rootProject.file("gradle/libs.versions.toml")
+diagnosticInputs.sortedBy { it.relativeTo(rootProject.projectDir).invariantSeparatorsPath }.forEach {
+    diagnosticDigest.update(it.relativeTo(rootProject.projectDir).invariantSeparatorsPath.toByteArray(Charsets.UTF_8))
+    diagnosticDigest.update(0.toByte())
+    diagnosticDigest.update(it.readBytes())
+}
+val diagnosticSourceId = diagnosticDigest.digest().joinToString("") { "%02x".format(it) }.take(16)
+
 android {
 
     namespace = "com.plexus.app"
@@ -52,6 +68,7 @@ android {
         versionCode = 1
         versionName = "1.0"
         buildConfigField("String", "PLEXUS_WEBSOCKET_URL", "\"$plexusWebSocketUrl\"")
+        buildConfigField("String", "PLEXUS_BUILD_ID", "\"$diagnosticRevision-proof-publication1-$diagnosticSourceId\"")
 
         testInstrumentationRunner =
             "androidx.test.runner.AndroidJUnitRunner"
@@ -189,6 +206,7 @@ dependencies {
 
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("org.robolectric:robolectric:4.16.1")
 
     /*
     * FIREBASE CLOUD MESSAGING

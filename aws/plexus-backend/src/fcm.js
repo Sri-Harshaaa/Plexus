@@ -26,17 +26,25 @@ const invalidToken = code => code === 'messaging/registration-token-not-register
     code === 'messaging/invalid-registration-token';
 
 export function createFcmPush({ store, secretId = process.env.FIREBASE_ADMIN_SECRET_ID ?? 'plexus/firebase-admin', log = console }) {
-    return async nodeId => {
+    return async (nodeId, correlation) => {
+        const diagnostic = (event, warning = false) => {
+            const record = JSON.stringify({ event,
+                ...(typeof correlation === 'string' && /^[0-9a-f]{12}$/.test(correlation) ? { id: correlation } : {}) });
+            if (warning) log.warn(record); else log.info?.(record);
+        };
         const tokens = await store.pushTokens(nodeId);
-        if (!tokens.length) return;
+        if (!tokens.length) { diagnostic('FCM_NO_REGISTRATION'); return; }
         let client;
         try { client = await messaging(secretId); }
-        catch { log.warn(JSON.stringify({ event: 'fcm_unavailable' })); return; }
+        catch { diagnostic('fcm_unavailable', true); return; }
         await Promise.all(tokens.map(async token => {
-            try { await client.send({ token, data: { type: 'plexus_sync' }, android: { priority: 'high' } }); }
+            try {
+                await client.send({ token, data: { type: 'plexus_sync' }, android: { priority: 'high' } });
+                diagnostic('FCM_WAKE_SENT');
+            }
             catch (e) {
-                if (invalidToken(e?.code)) await store.deletePushToken(nodeId, token);
-                else log.warn(JSON.stringify({ event: 'fcm_send_failed' }));
+                if (invalidToken(e?.code)) { diagnostic('FCM_TOKEN_INVALID', true); await store.deletePushToken(nodeId, token); }
+                else diagnostic('fcm_send_failed', true);
             }
         }));
     };

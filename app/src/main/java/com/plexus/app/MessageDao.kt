@@ -172,7 +172,7 @@ interface MessageDao {
     suspend fun markMessageDelivered(
         messageId: String,
         recipientNodeId: String
-    )
+    ): Int
 
 
     /*

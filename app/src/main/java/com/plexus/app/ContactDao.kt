@@ -157,7 +157,7 @@ interface ContactDao {
         UPDATE contacts
         SET relationshipState = :relationshipState,
             pendingRequestId = :pendingRequestId
-        WHERE nodeId = :nodeId
+        WHERE nodeId = :nodeId AND relationshipState NOT IN ('BLOCKED', 'BLOCKED_CONNECTED')
         """
     )
     suspend fun updateRelationshipState(
@@ -217,7 +217,7 @@ interface ContactDao {
         SET displayName = :displayName,
             relationshipState = 'CONNECTED',
             pendingRequestId = NULL
-        WHERE nodeId = :nodeId
+        WHERE nodeId = :nodeId AND relationshipState = 'ACCEPTED_NEEDS_NAME'
         """
     )
     suspend fun markConnected(
@@ -237,13 +237,22 @@ interface ContactDao {
         UPDATE contacts
         SET relationshipState = 'DECLINED',
             pendingRequestId = NULL
-        WHERE nodeId = :nodeId
+        WHERE nodeId = :nodeId AND relationshipState NOT IN ('BLOCKED', 'BLOCKED_CONNECTED')
         """
     )
     suspend fun markDeclined(
         nodeId: String
     )
 
+
+    @Query("SELECT * FROM contacts WHERE relationshipState IN ('BLOCKED', 'BLOCKED_CONNECTED') ORDER BY displayName ASC")
+    fun getBlockedContacts(): Flow<List<ContactEntity>>
+
+    @Query("UPDATE contacts SET relationshipState = CASE WHEN relationshipState IN ('CONNECTED', 'BLOCKED_CONNECTED') THEN 'BLOCKED_CONNECTED' ELSE 'BLOCKED' END, pendingRequestId = :declinedRequestId WHERE nodeId = :nodeId")
+    suspend fun blockContact(nodeId: String, declinedRequestId: String? = null)
+
+    @Query("UPDATE contacts SET relationshipState = CASE WHEN relationshipState = 'BLOCKED_CONNECTED' THEN 'CONNECTED' ELSE 'NONE' END, pendingRequestId = NULL WHERE nodeId = :nodeId AND relationshipState IN ('BLOCKED', 'BLOCKED_CONNECTED')")
+    suspend fun unblockContact(nodeId: String)
 
     /*
      * Delete one relationship/contact.

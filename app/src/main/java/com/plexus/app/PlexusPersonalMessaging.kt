@@ -6,6 +6,7 @@ import android.os.Looper
 import android.util.Log
 import com.google.firebase.messaging.FirebaseMessaging
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicBoolean
 
 internal fun isPersonalMessagingReady(starting: Boolean, runtimePresent: Boolean): Boolean =
     !starting && runtimePresent
@@ -33,6 +34,7 @@ internal object PlexusPersonalMessaging {
 
     @Suppress("DEPRECATION")
     fun start(context: Context, onStarted: (() -> Unit)? = null, onFailed: ((Throwable) -> Unit)? = null) {
+        Log.d("PlexusSync", "PERSONAL_RUNTIME_START_REQUESTED")
         main.post {
             if (starting) {
                 onStarted?.let(startCallbacks::add)
@@ -41,6 +43,7 @@ internal object PlexusPersonalMessaging {
             }
             val current = runtime
             if (isPersonalMessagingReady(starting, current != null)) {
+                Log.d("PlexusSync", "PERSONAL_RUNTIME_READY")
                 onStarted?.invoke()
                 return@post
             }
@@ -49,15 +52,22 @@ internal object PlexusPersonalMessaging {
             starting = true
             onStarted?.let(startCallbacks::add)
             onFailed?.let(startFailureCallbacks::add)
-            val identity = IdentityManager.getOrCreateIdentity(
-                ProfileManager.getDisplayName(context).orEmpty()
-            )
-            val created = PlexusTransportRuntime(
-                context.applicationContext, identity, PlexusDatabase.getDatabase(context)
-            )
+            val created = try {
+                val identity = IdentityManager.getOrCreateIdentity(
+                    ProfileManager.getDisplayName(context).orEmpty()
+                )
+                PlexusTransportRuntime(context.applicationContext, identity, PlexusDatabase.getDatabase(context))
+            } catch (failure: Exception) {
+                starting = false
+                startCallbacks.clear()
+                Log.e("PlexusPersonal", "PERSONAL_RUNTIME_START_FAILED")
+                startFailureCallbacks.toList().also { startFailureCallbacks.clear() }.forEach { it(failure) }
+                return@post
+            }
             runtime = created
             created.startPersonalMessaging(
                 onStarted = {
+                    Log.d("PlexusSync", "PERSONAL_RUNTIME_READY")
                     starting = false
                     startFailureCallbacks.clear()
                     FirebaseMessaging.getInstance().token.addOnSuccessListener { token ->
@@ -67,8 +77,12 @@ internal object PlexusPersonalMessaging {
                     startCallbacks.toList().also { startCallbacks.clear() }.forEach { it() }
                 },
                 onFailed = { failure ->
-                    Log.e("PlexusPersonal", "Personal messaging startup failed", failure)
-                    if (runtime === created) runtime = null
+                    if (runtime !== created) return@startPersonalMessaging
+                    Log.e("PlexusPersonal", "PERSONAL_RUNTIME_START_FAILED")
+                    // A failed Room observer must not leave live managers behind the next startup.
+                    runCatching { created.shutdown() }
+                        .onFailure { Log.e("PlexusPersonal", "PERSONAL_RUNTIME_SHUTDOWN_FAILED") }
+                    runtime = null
                     starting = false
                     startCallbacks.clear()
                     startFailureCallbacks.toList().also { startFailureCallbacks.clear() }.forEach { it(failure) }
@@ -122,11 +136,22 @@ internal object PlexusPersonalMessaging {
         main.post { runtime?.retryPersonalPending() }
     }
 
-    fun syncPending(context: Context, onComplete: () -> Unit) {
+    fun syncPending(context: Context, onComplete: (Boolean) -> Unit): () -> Unit {
+        val cancelled = AtomicBoolean(false)
+        val requestId = java.util.UUID.randomUUID().toString()
         start(context) {
-            runtime?.syncPersonalPending(onComplete)
+            if (!cancelled.get()) runtime?.syncPersonalPending(requestId, onComplete)
+        }
+        return {
+            cancelled.set(true)
+            main.post { runtime?.cancelPersonalSync(requestId) }
+            Unit
         }
     }
+
+    fun wakeForSync() { main.post { runtime?.wakeForSync() } }
+
+    fun refreshPeerPolicy() { main.post { runtime?.refreshPeerPolicy() } }
 
     fun registerPushToken(token: String) {
         main.post { runtime?.registerPushToken(token) }

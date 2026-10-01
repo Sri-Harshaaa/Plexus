@@ -135,7 +135,10 @@ data class AntiPacketEntity(
      * debugging
      */
 
-    val storedAt: Long
+    val storedAt: Long,
+
+    // Local Internet publication metadata; never serialized into the signed proof.
+    val internetPublishedAt: Long? = null
 ) {
 
 

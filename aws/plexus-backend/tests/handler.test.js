@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setup, identity, message, proof, request, response, signed } from './fixtures.js';
-import { authBytes, proofBytes, controlBytes, originBytes, DAY } from '../src/protocol.js';
+import { authBytes, proofBytes, controlBytes, originBytes, row, DAY } from '../src/protocol.js';
 import { TransactionCanceledException } from '@aws-sdk/client-dynamodb';
 
 const canceled = reasons => new TransactionCanceledException({ $metadata: { httpStatusCode: 400 },
@@ -56,10 +56,10 @@ test('push token is bound only to the authenticated connection identity', async 
     await s.call('a', 'registerPushToken', { token: 'y'.repeat(40) });
     assert.deepEqual(await s.store.pushTokens(a.nodeId), ['y'.repeat(40)]);
 });
-test('offline durable message triggers a sync wake but live delivery does not', async () => {
+test('durable message triggers a sync wake even when a socket write succeeds', async () => {
     const s = setup(), a = identity(), b = identity(); await s.auth('a', a);
     await s.call('a', 'sendPacket', { packet: message(a, b, s.now()) }); assert.deepEqual(s.pushes, [b.nodeId]);
-    await s.auth('b', b); await s.call('a', 'sendPacket', { packet: message(a, b, s.now()) }); assert.deepEqual(s.pushes, [b.nodeId]);
+    await s.auth('b', b); await s.call('a', 'sendPacket', { packet: message(a, b, s.now()) }); assert.deepEqual(s.pushes, [b.nodeId, b.nodeId]);
 });
 test('offline message is durably queued before accepted acknowledgement', async () => {
     const s = setup(), a = identity(), b = identity(); await s.auth('a', a); s.store.trace.length = 0;
@@ -426,13 +426,13 @@ test('sync skips and cleans expired pending rows independent of DynamoDB TTL del
     await s.call('a', 'sendPacket', { packet: p }); s.advance(DAY); await s.auth('b', b);
     assert.equal(s.events.some(e => e.event === 'internet:packet'), false); assert.equal(s.store.packets.size, 0);
 });
-test('sync ordering is proofs, controls, then messages and repeat sync is logically idempotent', async () => {
+test('sync has a bounded message head start followed by proofs and controls; repeat delivery keeps stable IDs', async () => {
     const s = setup(), a = identity(), b = identity(); await s.auth('b', b);
     await s.call('b', 'sendPacket', { packet: message(b, a, s.now()) });
     await s.call('b', 'sendPacket', { packet: request(b, a, s.now()) });
     await s.call('b', 'deliveryProof', { packet: proof(message(a, b, s.now()), b, s.now()) });
     s.events.length = 0; await s.auth('a', a);
-    const expected = ['internet:anti_packet', 'internet:connection_request', 'internet:packet'];
+    const expected = ['internet:packet', 'internet:anti_packet', 'internet:connection_request'];
     assert.deepEqual(s.events.filter(e => e.id === 'a' && expected.includes(e.event)).map(e => e.event), expected);
     s.events.length = 0; await s.call('a', 'sync');
     assert.deepEqual(s.events.filter(e => expected.includes(e.event)).map(e => e.event), expected);
@@ -495,7 +495,7 @@ test('sync pagination resumes after the exact prior key without dropping packets
     const cursor = s.events.at(-1).data.cursor; assert.ok(cursor);
     assert.equal(s.events.filter(e => e.event === 'internet:packet').length, 20);
     await s.call('b', 'sync', { cursor });
-    const packets = s.events.filter(e => e.event === 'internet:packet'); assert.equal(packets.length, 25);
+    const packets = s.events.filter(e => e.event === 'internet:packet'); assert.equal(packets.length, 30); // Separate lanes may redeliver stable IDs.
     assert.equal(new Set(packets.map(e => e.data.packetId)).size, 25);
 });
 test('unknown fields are never persisted and JSON member order does not change idempotency', async () => {
@@ -504,4 +504,258 @@ test('unknown fields are never persisted and JSON member order does not change i
     await s.call('a', 'sendPacket', { packet: Object.fromEntries(Object.entries(p).reverse()) });
     assert.equal(s.error(), undefined); assert.equal(s.store.packets.size, 1);
     assert.equal([...s.store.packets.values()][0].payload.unrelated, undefined);
+});
+
+
+test('peer blocking is authenticated and cannot bind a policy to another recipient', async () => {
+    const s = setup(), a = identity(), b = identity();
+    await s.call('a', '$connect');
+    await s.call('a', 'setPeerBlocked', { peerNodeId: b.nodeId, blocked: true, revision: 1 });
+    assert.equal(s.error(), 'NOT_AUTHENTICATED');
+    await s.auth('a', a);
+    await s.call('a', 'setPeerBlocked', { nodeId: b.nodeId, peerNodeId: b.nodeId, blocked: true, revision: 1 });
+    assert.equal(await s.store.peerBlocked(a.nodeId, b.nodeId), true);
+    assert.equal(await s.store.peerBlocked(b.nodeId, a.nodeId), false);
+});
+test('blocked origin messages and requests are suppressed without wakes or delivery proofs', async () => {
+    const s = setup(), a = identity(), b = identity(); await s.auth('a', a); await s.auth('b', b);
+    await s.call('b', 'setPeerBlocked', { peerNodeId: a.nodeId, blocked: true, revision: 1 });
+    s.events.length = 0;
+    await s.call('a', 'sendPacket', { packet: message(a, b, s.now()) });
+    await s.call('a', 'sendPacket', { packet: request(a, b, s.now()) });
+    assert.equal((await s.store.page(b.nodeId)).items.length, 0); assert.equal(s.pushes.length, 0);
+    assert.equal(s.events.some(e => ['internet:packet', 'internet:connection_request', 'internet:anti_packet'].includes(e.event)), false);
+    assert.equal([...s.store.vaccines.values()].some(v => v.proof), false);
+});
+test('blocking cleans pending backlog with discard tombstones, not proofs; unblocking cannot resurrect it', async () => {
+    const s = setup(), a = identity(), b = identity(); await s.auth('a', a);
+    const packet = message(a, b, s.now()); const req = request(a, b, s.now());
+    await s.call('a', 'sendPacket', { packet }); await s.call('a', 'sendPacket', { packet: req });
+    await s.auth('b', b);
+    await s.call('b', 'setPeerBlocked', { peerNodeId: a.nodeId, blocked: true, revision: 1 });
+    s.events.length = 0;
+    await s.call('b', 'sync'); await s.call('b', 'sync');
+    assert.deepEqual((await s.store.page(b.nodeId)).items, []);
+    assert.equal(s.store.vaccines.get(packet.packetId).discarded, true);
+    assert.equal(s.store.vaccines.get(packet.packetId).proof, undefined);
+    assert.equal(s.events.some(e => ['internet:packet', 'internet:connection_request', 'internet:anti_packet'].includes(e.event)), false);
+    await s.call('b', 'setPeerBlocked', { peerNodeId: a.nodeId, blocked: false, revision: 2 });
+    await s.call('a', 'sendPacket', { packet });
+    await s.call('a', 'sendPacket', { packet: req });
+    assert.deepEqual((await s.store.page(b.nodeId)).items, []);
+    assert.equal(s.events.some(e => e.event === 'internet:anti_packet'), false);
+    await s.call('a', 'sendPacket', { packet: request(a, b, s.now()) });
+    assert.equal((await s.store.page(b.nodeId)).items.length, 1);
+});
+test('blocked discard requires the authenticated destination and blocked source', async () => {
+    const s = setup(), a = identity(), b = identity(), attacker = identity();
+    await s.auth('a', a); await s.auth('attacker', attacker);
+    const packet = message(a, b, s.now()); await s.call('a', 'sendPacket', { packet });
+    const pending = (await s.store.page(b.nodeId)).items[0];
+    await s.call('attacker', 'discardBlockedPacket', { nodeId: b.nodeId, packetKey: pending.packetKey, peerNodeId: a.nodeId });
+    assert.equal(s.error(), 'PEER_NOT_BLOCKED');
+    await s.call('attacker', 'setPeerBlocked', { peerNodeId: a.nodeId, blocked: true, revision: 1 });
+    await s.call('attacker', 'discardBlockedPacket', { nodeId: b.nodeId, packetKey: pending.packetKey, peerNodeId: a.nodeId });
+    assert.equal((await s.store.page(b.nodeId)).items.length, 1);
+    await s.auth('b', b);
+    await s.call('b', 'setPeerBlocked', { peerNodeId: a.nodeId, blocked: true, revision: 1 });
+    await s.call('b', 'discardBlockedPacket', { packetKey: pending.packetKey, peerNodeId: a.nodeId });
+    assert.equal((await s.store.page(b.nodeId)).items.length, 0);
+    assert.equal(s.store.vaccines.get(packet.packetId).proof, undefined);
+});
+test('stale policy retries cannot re-block after an explicit unblock', async () => {
+    const s = setup(), a = identity(), b = identity(); await s.auth('b', b);
+    await s.call('b', 'setPeerBlocked', { peerNodeId: a.nodeId, blocked: true, revision: 1 });
+    await s.call('b', 'setPeerBlocked', { peerNodeId: a.nodeId, blocked: false, revision: 2 });
+    await s.call('b', 'setPeerBlocked', { peerNodeId: a.nodeId, blocked: true, revision: 1 });
+    assert.equal(await s.store.peerBlocked(b.nodeId, a.nodeId), false);
+});
+test('gateway upload blocking binds to original sender, never uploader', async () => {
+    const s = setup(), a = identity(), b = identity(), c = identity(); await s.auth('b', b); await s.auth('c', c);
+    await s.call('c', 'setPeerBlocked', { peerNodeId: a.nodeId, blocked: true, revision: 1 });
+    await s.call('b', 'sendPacket', { packet: message(a, c, s.now()) });
+    assert.equal((await s.store.page(c.nodeId)).items.length, 0);
+    assert.equal(s.pushes.length, 0);
+});
+
+for (const type of ['message', 'request']) test(`discarded ${type} cannot resurrect after interrupted deletion and unblock`, async () => {
+    const s = setup(), a = identity(), b = identity(); await s.auth('a', a);
+    const packet = type === 'message' ? message(a, b, s.now()) : request(a, b, s.now());
+    await s.call('a', 'sendPacket', { packet }); await s.auth('b', b);
+    await s.call('b', 'setPeerBlocked', { peerNodeId: a.nodeId, blocked: true, revision: 1 });
+    s.store.beforeDelete = () => { throw new Error('interrupted deletion'); };
+    await s.call('b', 'sync'); assert.equal(s.error(), 'RETRY_REQUIRED');
+    assert.equal((await s.store.page(b.nodeId)).items.length, 1);
+    s.store.beforeDelete = undefined;
+    await s.call('b', 'setPeerBlocked', { peerNodeId: a.nodeId, blocked: false, revision: 2 });
+    s.events.length = 0; await s.call('b', 'sync');
+    assert.deepEqual((await s.store.page(b.nodeId)).items, []);
+    assert.equal(s.events.some(e => ['internet:packet', 'internet:connection_request', 'internet:anti_packet'].includes(e.event)), false);
+});
+test('block arriving during persistence suppresses live delivery and FCM without a proof', async () => {
+    const s = setup(), a = identity(), b = identity(); await s.auth('a', a); await s.auth('b', b);
+    s.store.afterQueue = async () => s.store.setPeerBlocked(b.nodeId, a.nodeId, true, 1);
+    s.events.length = 0;
+    const packet = message(a, b, s.now()); await s.call('a', 'sendPacket', { packet });
+    assert.deepEqual((await s.store.page(b.nodeId)).items, []);
+    assert.equal(s.store.vaccines.get(packet.packetId).proof, undefined);
+    assert.equal(s.pushes.length, 0);
+    assert.equal(s.events.some(e => ['internet:packet', 'internet:anti_packet'].includes(e.event)), false);
+});
+test('FCM failure never removes the durable packet or acknowledges destination delivery', async () => {
+    const s = setup({ pushFailure: true }), a = identity(), b = identity(); await s.auth('a', a);
+    const packet = message(a, b, s.now()); await s.call('a', 'sendPacket', { packet });
+    assert.equal((await s.store.page(b.nodeId)).items.length, 1);
+    assert.equal(s.store.vaccines.get(packet.packetId).proof, undefined);
+    assert.equal(s.events.some(e => e.event === 'internet:anti_packet'), false);
+    assert.equal(s.events.filter(e => e.event === 'internet:ack').at(-1).data.accepted, true);
+    await s.auth('b', b);
+    assert.equal(s.events.some(e => e.id === 'b' && e.event === 'internet:packet'), true);
+});
+
+function seedSyncBacklog(s, sender, recipient, messageCount) {
+    for (let i = 0; i < 200; i++) {
+        const p = proof(message(recipient, sender, s.now() + i), sender, s.now() + i);
+        const item = row(p, { type: 'DELIVERY_PROOF', id: p.messageId, source: sender.nodeId,
+            destination: recipient.nodeId, priority: 0, event: 'internet:anti_packet' });
+        s.store.packets.set(s.store.key(recipient.nodeId, item.packetKey), item);
+    }
+    const messages = Array.from({ length: messageCount }, (_, i) => message(sender, recipient, s.now() + i));
+    for (const p of messages) {
+        const item = row(p, { type: 'MESSAGE', id: p.packetId, source: sender.nodeId,
+            destination: recipient.nodeId, priority: 2, event: 'internet:packet' });
+        s.store.packets.set(s.store.key(recipient.nodeId, item.packetKey), item);
+    }
+    const req = request(sender, recipient, s.now());
+    const item = row(req, { type: 'CONNECTION_REQUEST', id: req.requestId, source: sender.nodeId,
+        destination: recipient.nodeId, priority: 1, event: 'internet:connection_request' });
+    s.store.packets.set(s.store.key(recipient.nodeId, item.packetKey), item);
+    return messages;
+}
+
+test('200 retained proofs cannot starve one pending message on first authentication without FGS', async () => {
+    const s = setup(), a = identity(), b = identity();
+    const [p] = seedSyncBacklog(s, a, b, 1);
+    await s.auth('b', b);
+    const delivered = s.events.filter(e => e.event.startsWith('internet:') && e.event !== 'internet:error');
+    assert.equal(delivered[0].data.packetId, p.packetId);
+    assert.equal(delivered.filter(e => e.event === 'internet:anti_packet').length, 20);
+    assert.equal(delivered.filter(e => e.event === 'internet:packet').length, 1);
+});
+
+test('interrupted reconnects rotate message batches and proof/control traversal despite newer live traffic', async () => {
+    const s = setup(), a = identity(), b = identity(); await s.auth('a', a);
+    const old = seedSyncBacklog(s, a, b, 13);
+    const seen = new Set(), proofs = new Set();
+    for (let i = 0; i < 11; i++) {
+        s.events.length = 0;
+        await s.auth(`b${i}`, b); // Never follow the returned pagination cursor.
+        const packets = s.events.filter(e => e.event === 'internet:packet');
+        for (const e of packets) seen.add(e.data.packetId);
+        for (const e of s.events.filter(e => e.event === 'internet:anti_packet')) proofs.add(e.data.messageId);
+        if (i < 3) assert.ok(packets.length <= 5);
+        if (i === 2) assert.ok(old.every(p => seen.has(p.packetId)));
+        if (i === 10) assert.ok(s.events.some(e => e.event === 'internet:connection_request'));
+        const fresh = message(a, b, s.now() + 1000 + i);
+        await s.call('a', 'sendPacket', { packet: fresh });
+        assert.ok(s.events.some(e => e.id === `b${i}` && e.data.packetId === fresh.packetId));
+        await s.call(`b${i}`, '$disconnect');
+    }
+    assert.equal(proofs.size, 200);
+});
+
+test('socket loss mid-lane advances scheduling without deleting skipped messages; wraparound recovers them', async () => {
+    const s = setup(), a = identity(), b = identity(); const pending = seedSyncBacklog(s, a, b, 12);
+    s.store.afterPost = async (id, frame) => {
+        if (id === 'b0' && frame.event === 'internet:packet') s.gone.add(id);
+    };
+    await s.auth('b0', b);
+    assert.equal(s.events.filter(e => e.event === 'internet:packet').length, 1);
+    s.store.afterPost = undefined;
+    for (let i = 1; i <= 3; i++) { await s.auth(`b${i}`, b); await s.call(`b${i}`, '$disconnect'); }
+    const seen = new Set(s.events.filter(e => e.event === 'internet:packet').map(e => e.data.packetId));
+    assert.ok(pending.every(p => seen.has(p.packetId)));
+    assert.equal([...s.store.packets.values()].filter(p => p.packetType === 'MESSAGE').length, 12);
+});
+
+test('busy continuation preserves checkpoints and duplicate sync stops returning ciphertext after signed proof', async () => {
+    const s = setup(), a = identity(), b = identity(); const pending = seedSyncBacklog(s, a, b, 12);
+    await s.auth('b', b);
+    const cursor = s.events.at(-1).data.cursor;
+    s.store.connections.get('b').lock = 'other';
+    await s.call('b', 'sync', { cursor });
+    assert.deepEqual(s.events.at(-1).data, { busy: true, cursor });
+    delete s.store.connections.get('b').lock;
+    s.events.length = 0; await s.call('b', 'sync'); // Even losing the client hint cannot reset progress.
+    assert.deepEqual(s.events.filter(e => e.event === 'internet:packet').map(e => e.data.packetId), pending.slice(5, 10).map(p => p.packetId));
+    await s.call('b', 'deliveryProof', { packet: proof(pending[0], b, s.now()) });
+    s.events.length = 0;
+    for (let i = 0; i < 4; i++) await s.call('b', 'sync');
+    assert.equal(s.events.some(e => e.event === 'internet:packet' && e.data.packetId === pending[0].packetId), false);
+    assert.ok(s.events.some(e => e.event === 'internet:packet' && e.data.packetId === pending[1].packetId));
+});
+
+test('concurrent sync claims use conditional durable progress and expired progress safely restarts', async () => {
+    const s = setup(), a = identity(), b = identity(); const pending = seedSyncBacklog(s, a, b, 12);
+    const pages = await Promise.all([s.store.claimSyncPage(b.nodeId, true, s.now()), s.store.claimSyncPage(b.nodeId, true, s.now())]);
+    assert.equal(new Set(pages.flatMap(p => p.items.map(i => i.stableId))).size, 2);
+    const page = await s.store.claimSyncPage(b.nodeId, true, s.now() + 8 * DAY);
+    assert.deepEqual(page.items.map(i => i.stableId), pending.slice(0, 1).map(p => p.packetId));
+});
+
+test('repeated connections dying after one ciphertext post do not permanently skip message batch tails', async () => {
+    const s = setup(), a = identity(), b = identity(); const pending = seedSyncBacklog(s, a, b, 10);
+    s.store.afterPost = async (id, frame) => { if (frame.event === 'internet:packet') s.gone.add(id); };
+    for (let i = 0; i < 10; i++) await s.auth(`b${i}`, b);
+    const seen = new Set(s.events.filter(e => e.event === 'internet:packet').map(e => e.data.packetId));
+    assert.ok(pending.every(p => seen.has(p.packetId)));
+    assert.equal([...s.store.packets.values()].filter(p => p.packetType === 'MESSAGE').length, 10);
+});
+
+test('interrupted normal traversal checkpoints the last posted proof, not the end of its unread page', async () => {
+    const s = setup(), a = identity(), b = identity(); seedSyncBacklog(s, a, b, 0);
+    s.store.afterPost = async (id, frame) => { if (frame.event === 'internet:anti_packet') s.gone.add(id); };
+    await s.auth('b0', b); await s.auth('b1', b);
+    const proofs = s.events.filter(e => e.event === 'internet:anti_packet');
+    const expected = [...s.store.packets.values()].filter(p => p.packetType === 'DELIVERY_PROOF')
+        .sort((a, b) => a.packetKey.localeCompare(b.packetKey)).slice(0, 2).map(p => p.stableId);
+    assert.deepEqual(proofs.map(e => e.data.messageId), expected);
+});
+
+test('late concurrent post cannot roll back a newer durable message checkpoint', async () => {
+    const s = setup(), a = identity(), b = identity(); const pending = seedSyncBacklog(s, a, b, 5);
+    let release, entered;
+    const held = new Promise(resolve => { release = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    const slow = s.store.claimSyncPage(b.nodeId, true, s.now(), async () => { entered(); await held; return true; });
+    await started;
+    await s.store.claimSyncPage(b.nodeId, true, s.now(), async () => true);
+    await s.store.claimSyncPage(b.nodeId, true, s.now(), async () => true);
+    release(); await slow;
+    const next = await s.store.claimSyncPage(b.nodeId, true, s.now(), async () => true);
+    assert.equal(next.items[0].stableId, pending[2].packetId);
+});
+
+test('diagnostic lifecycle correlates authenticated message persistence, sync and ACK without raw identity or packet data', async () => {
+    const { createHash } = await import('node:crypto');
+    const short = v => createHash('sha256').update(v).digest('hex').slice(0, 12);
+    const s = setup(), a = identity(), b = identity(); await s.auth('sender-private-connection', a);
+    const p = message(a, b, s.now());
+    await s.call('sender-private-connection', 'sendPacket', { packet: p });
+    await s.auth('recipient-private-connection', b);
+    const events = s.diagnostics.filter(d => d.id === short(p.packetId)).map(d => d.event);
+    for (const expected of ['SEND_PACKET_VALIDATED', 'MESSAGE_PERSIST_BEGIN', 'PENDING_MESSAGE_STORED',
+        'LIVE_FORWARD_RESULT', 'FCM_WAKE_ATTEMPT', 'SEND_PACKET_ACK_POSTED', 'SYNC_MESSAGE_SELECTED', 'SYNC_MESSAGE_POST_RESULT']) {
+        assert.ok(events.includes(expected), expected);
+    }
+    for (const expected of ['WS_CONNECTED', 'AUTH_INIT_VALIDATED', 'AUTH_CHALLENGE_POSTED',
+        'AUTH_PROOF_VERIFIED', 'AUTH_SUCCESS_POSTED', 'SYNC_BEGIN', 'MESSAGE_LANE_BEGIN', 'SYNC_COMPLETE_POSTED']) {
+        assert.ok(s.diagnostics.some(d => d.event === expected), expected);
+    }
+    const logs = JSON.stringify(s.diagnostics);
+    for (const raw of [p.packetId, a.nodeId, b.nodeId, a.signingPublicKey, b.signingPublicKey,
+        p.originSignature, p.encryptedPayload, 'sender-private-connection', 'recipient-private-connection']) {
+        assert.equal(logs.includes(raw), false);
+    }
+    assert.ok(s.diagnostics.every(d => d.connection.match(/^[a-f0-9]{12}$/)));
 });

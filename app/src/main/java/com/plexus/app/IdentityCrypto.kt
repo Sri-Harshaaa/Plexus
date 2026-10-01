@@ -103,6 +103,8 @@ object IdentityCrypto {
         responderNodeId: String
 
     ): String {
+        val diagnosticTiming = PlexusDiagnostics.begin("KEYSTORE_SIGN", "identitySignature")
+        try {
 
 
         val privateKey =
@@ -141,6 +143,8 @@ object IdentityCrypto {
 
             Base64.NO_WRAP
         )
+
+        } finally { PlexusDiagnostics.end(diagnosticTiming) }
     }
 
 
@@ -160,6 +164,8 @@ object IdentityCrypto {
         publicKeyBase64: String
 
     ): Boolean {
+        val diagnosticTiming = PlexusDiagnostics.begin("VERIFY", "identitySignature")
+        try {
 
 
         return try {
@@ -208,6 +214,8 @@ object IdentityCrypto {
 
             false
         }
+
+        } finally { PlexusDiagnostics.end(diagnosticTiming) }
     }
 
 

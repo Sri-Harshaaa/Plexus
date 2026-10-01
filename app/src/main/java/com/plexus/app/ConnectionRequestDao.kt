@@ -128,6 +128,8 @@ interface ConnectionRequestDao {
         FROM connection_requests
         WHERE senderNodeId = :localNodeId
           AND expiresAt > :now
+          AND EXISTS (SELECT 1 FROM contacts c WHERE c.nodeId = recipientNodeId
+              AND c.relationshipState = 'OUTGOING_PENDING' AND c.pendingRequestId = requestId)
         ORDER BY storedAt ASC
         """
     )

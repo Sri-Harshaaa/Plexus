@@ -1,5 +1,6 @@
 import { createHash, generateKeyPairSync, sign, randomUUID } from 'node:crypto';
 import { authBytes, proofBytes, controlBytes, originBytes, DAY } from '../src/protocol.js';
+import { DynamoStore } from '../src/store.js';
 import { createHandler } from '../src/handler.js';
 
 export function identity() {
@@ -39,7 +40,7 @@ export function response(req, b, now) {
 const copy = value => value === undefined ? value : structuredClone(value);
 function conflict() { const e = new Error('conditional'); e.name = 'ConditionalCheckFailedException'; throw e; }
 export class MemoryStore {
-    connections = new Map(); vaccines = new Map(); packets = new Map(); push = new Map(); trace = [];
+    connections = new Map(); vaccines = new Map(); packets = new Map(); push = new Map(); peerPolicies = new Map(); trace = [];
     key(node, key) { return `${node}/${key}`; }
     async connection(id) { return copy(this.connections.get(id)); }
     async vaccine(id) { return copy(this.vaccines.get(id)); }
@@ -59,7 +60,7 @@ export class MemoryStore {
     async queueMessage(item, uploader) {
         await this.beforeQueue?.();
         const old = this.vaccines.get(item.stableId);
-        if (old?.proof || (old && (old.sourceNodeId !== item.sourceNodeId || old.recipientNodeId !== item.destinationNodeId || old.packetDigest !== item.digest))) conflict();
+        if (old?.proof || old?.discarded || (old && (old.sourceNodeId !== item.sourceNodeId || old.recipientNodeId !== item.destinationNodeId || old.packetDigest !== item.digest))) conflict();
         const gateways = new Set(old?.gatewayNodeIds ?? []);
         if (uploader && uploader !== item.sourceNodeId) {
             if (!gateways.has(uploader) && gateways.size >= 16) conflict();
@@ -96,6 +97,20 @@ export class MemoryStore {
     }
     async pushTokens(node) { return [...this.push.entries()].filter(([key]) => key.startsWith(`${node}/`)).map(([, token]) => token); }
     async deletePushToken(node, token) { this.push.delete(this.key(node, token)); }
+    async peerBlocked(node, peer) { return this.peerPolicies.get(this.key(node, peer))?.blocked === true; }
+    async setPeerBlocked(node, peer, blocked, revision) {
+        const key = this.key(node, peer);
+        if ((this.peerPolicies.get(key)?.revision ?? 0) <= revision) this.peerPolicies.set(key, { blocked, revision });
+    }
+    async discardBlocked(item) {
+        if (item.packetType === 'MESSAGE') this.vaccines.set(item.stableId, {
+            ...this.vaccines.get(item.stableId), sourceNodeId: item.sourceNodeId, recipientNodeId: item.destinationNodeId,
+            packetDigest: item.digest, createdAt: item.createdAt, expiresAt: item.expiresAt, ttl: item.ttl, discarded: true
+        });
+        else if (item.packetType === 'CONNECTION_REQUEST') this.packets.set(this.key(item.destinationNodeId, `9#CONNECTION_REQUEST#${item.stableId}`),
+            { ...copy(item), packetKey: `9#CONNECTION_REQUEST#${item.stableId}`, pendingKey: item.packetKey, blockedDiscard: true });
+        await this.deletePending(item.destinationNodeId, item.packetKey);
+    }
     async saveControl(item, markerKey) {
         await this.beforeSaveControl?.();
         const key = this.key(item.destinationNodeId, markerKey);
@@ -108,19 +123,42 @@ export class MemoryStore {
             (!cursor || p.packetKey > cursor.packetKey)).sort((a, b) => a.packetKey.localeCompare(b.packetKey));
         return { items: copy(items.slice(0, 20)), cursor: items.length > 20 ? { destinationNodeId: node, packetKey: items[19].packetKey } : undefined };
     }
+    syncProgress = new Map();
+    async messagePage(node, cursor) {
+        const items = [...this.packets.values()].filter(p => p.destinationNodeId === node && p.packetKey.startsWith('2#') &&
+            (!cursor || p.packetKey > cursor.packetKey)).sort((a, b) => a.packetKey.localeCompare(b.packetKey));
+        return { items: copy(items.slice(0, 1)), cursor: items.length > 1 ? { destinationNodeId: node, packetKey: items[0].packetKey } : undefined };
+    }
+    async claimSyncPage(node, messages, now, visit) {
+        // Exercise the production checkpoint algorithm, including conditional writes.
+        const memory = this;
+        return DynamoStore.prototype.claimSyncPage.call({
+            tables: { pending: 'pending' },
+            pending: async (n, k) => copy(memory.syncProgress.get(memory.key(n, k))),
+            page: (...args) => memory.page(...args), messagePage: (...args) => memory.messagePage(...args),
+            db: { async send(command) {
+                const { Item: item, ExpressionAttributeValues: values } = command.input;
+                const key = memory.key(item.destinationNodeId, item.packetKey), old = memory.syncProgress.get(key);
+                if (values ? old?.revision !== values[':revision'] : old) conflict();
+                memory.syncProgress.set(key, copy(item));
+            } }
+        }, node, messages, now, visit);
+    }
     async lockSync(id, token) { const c = this.connections.get(id); if (!c || c.lock) return false; c.lock = token; return true; }
     async unlockSync(id, token) { const c = this.connections.get(id); if (c?.lock === token) delete c.lock; }
 }
-export function setup() {
+export function setup({ pushFailure = false } = {}) {
     const store = new MemoryStore();
     const events = [];
     const pushes = [];
+    const diagnostics = [];
     let clock = 1_800_000_000_000;
     const gone = new Set();
-    const handler = createHandler({ store, now: () => clock, log: { warn() {} }, push: async node => { pushes.push(node); },
+    const handler = createHandler({ store, now: () => clock, log: { warn() {}, info(record) { diagnostics.push(JSON.parse(record)); } }, push: async node => { pushes.push(node); if (pushFailure) throw new Error('push unavailable'); },
         transport: () => async (id, envelope) => {
             if (gone.has(id)) { const e = new Error(); e.name = 'GoneException'; throw e; }
             store.trace.push('post'); events.push({ id, ...copy(envelope) });
+            await store.afterPost?.(id, envelope);
         } });
     async function call(id, action, body = {}) {
         return handler({ requestContext: { routeKey: action, connectionId: id, domainName: 'unit.invalid', stage: 'production' },
@@ -133,6 +171,6 @@ export function setup() {
         await call(id, 'authProof', { challengeId: challenge.challengeId,
             signature: signed(authBytes(who.nodeId, challenge.challengeId, challenge.challenge), who) });
     }
-    return { store, events, pushes, handler, call, auth, gone, now: () => clock, advance: delta => { clock += delta; },
+    return { store, events, pushes, diagnostics, handler, call, auth, gone, now: () => clock, advance: delta => { clock += delta; },
         error: () => events.filter(e => e.event === 'internet:error').at(-1)?.data.error };
 }
